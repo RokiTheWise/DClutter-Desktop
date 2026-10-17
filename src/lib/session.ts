@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type DecisionKind = "keep" | "stage" | "skip";
+export type DecisionKind = "keep" | "stage" | "skip" | "file";
 
 /** Mirrors `CardItem` in src-tauri/src/lib.rs. Timestamps are Unix seconds. */
 export interface CardItem {
@@ -79,6 +79,35 @@ export function stagedFiles(): Promise<StagedItem[]> {
 /** Keeps the `excluded` files and recycles every other staged file. */
 export function commitTrash(excluded: string[]): Promise<CommitOutcome> {
   return invoke("commit_trash", { excluded });
+}
+
+/** Mirrors `DestinationItem` in src-tauri/src/lib.rs. */
+export interface DestinationItem {
+  id: string;
+  name: string;
+  path: string;
+}
+
+/** The most destinations the shelf holds. Matches `MAX_DESTINATIONS`. */
+export const MAX_DESTINATIONS = 3;
+
+export function listDestinations(): Promise<DestinationItem[]> {
+  return invoke("list_destinations");
+}
+
+/** Opens the folder picker and adds the choice to the shelf. */
+export function addDestination(): Promise<DestinationItem[]> {
+  return invoke("add_destination");
+}
+
+/** Takes a folder off the shelf; the folder itself is left alone. */
+export function removeDestination(id: string): Promise<DestinationItem[]> {
+  return invoke("remove_destination", { id });
+}
+
+/** Files the current card's file into destination `id` right away. */
+export function fileCurrent(id: string): Promise<SessionView> {
+  return invoke("file_current", { id });
 }
 
 /** Opens the file on the card in its default app. */
