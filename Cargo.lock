@@ -672,11 +672,20 @@ name = "dclutter-desktop"
 version = "0.1.0"
 dependencies = [
  "dclutter-core",
+ "dclutter-platform",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+]
+
+[[package]]
+name = "dclutter-platform"
+version = "0.1.0"
+dependencies = [
+ "dclutter-core",
+ "tempfile",
 ]
 
 [[package]]

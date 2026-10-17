@@ -1,0 +1,13 @@
+[package]
+name = "dclutter-platform"
+description = "Filesystem access for DClutter: reading folders into scoring candidates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+dclutter-core = { path = "../dclutter-core" }
+
+[dev-dependencies]
+tempfile = "3"
