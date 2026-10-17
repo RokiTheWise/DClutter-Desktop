@@ -3,6 +3,7 @@
 //  Licensed under the Apache License, Version 2.0.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -12,8 +13,9 @@ use crate::FileCandidate;
 ///
 /// `Staged` means "marked for trash, not yet trashed". `Trashed` is the
 /// terminal state after the Recycle Bin took the file, kept distinct so
-/// undo can never bring back a card for a file that is gone. Moving and
-/// renaming add their own states later, as in the macOS app.
+/// undo can never bring back a card for a file that is gone. `Moved` means
+/// already filed into a destination folder; unlike staging it happens at
+/// once, and undo moves the file back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FileState {
@@ -21,21 +23,45 @@ pub enum FileState {
     Kept,
     Staged,
     Trashed,
+    Moved,
 }
 
-/// The three decisions the triage card offers.
+/// The decisions the triage card offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DecisionKind {
     Keep,
     Stage,
     Skip,
+    /// Filed into a destination folder.
+    File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Decision {
     kind: DecisionKind,
     id: String,
+    /// Where a filed file now is. Set only for `File`.
+    moved_to: Option<PathBuf>,
+}
+
+/// Disk work the caller must do for the folder to match the session. The
+/// session itself never touches files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskMove {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
+/// What an undo or redo changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub kind: DecisionKind,
+    /// For a filed file, the move that undoes or redoes it. If that move
+    /// fails, call the opposite of what was just called (`redo` after a
+    /// failed undo, `undo` after a failed redo), ignoring its `DiskMove`,
+    /// so the session goes back to matching the disk.
+    pub disk: Option<DiskMove>,
 }
 
 /// The triage state machine, ported from `DClutterSession` in the macOS app.
@@ -103,7 +129,7 @@ impl TriageSession {
         self.queue.len()
     }
 
-    /// Kept or staged decisions since the last commit. Skips don't count:
+    /// Kept, staged or filed decisions since the last commit. Skips don't count:
     /// a skipped file still needs a decision.
     pub fn sorted_count(&self) -> usize {
         self.sorted
@@ -131,7 +157,11 @@ impl TriageSession {
     /// nothing, when there is no current file.
     pub fn decide(&mut self, kind: DecisionKind) -> bool {
         let Some(id) = self.current().map(|c| c.id.clone()) else { return false };
-        let decision = Decision { kind, id };
+        // Filing goes through `begin_file`, which needs a destination.
+        if kind == DecisionKind::File {
+            return false;
+        }
+        let decision = Decision { kind, id, moved_to: None };
         self.apply(&decision);
         // A skip that doesn't change the visible file (it was the only one
         // left) shouldn't leave a dead undo entry, or undo appears to do
@@ -144,23 +174,72 @@ impl TriageSession {
         true
     }
 
-    /// Reverts the most recent decision and returns what it was, so the
-    /// interface can bring the card back from the way it left.
-    pub fn undo(&mut self) -> Option<DecisionKind> {
+    /// Records filing the current file to `planned`, before anything moves
+    /// on disk, so a move is never left without an undo entry. Returns its
+    /// id and current path for the caller to move. Afterwards, call
+    /// `amend_last_move` with where it really landed, or
+    /// `withdraw_last_move` if the move failed.
+    pub fn begin_file(&mut self, planned: PathBuf) -> Option<(String, PathBuf)> {
+        let current = self.current()?;
+        let (id, path) = (current.id.clone(), current.path.clone());
+        let decision = Decision { kind: DecisionKind::File, id: id.clone(), moved_to: Some(planned) };
+        self.apply(&decision);
+        self.history.push(decision);
+        self.redo_stack.clear();
+        Some((id, path))
+    }
+
+    /// Corrects where the last filed file landed. The folder may have
+    /// numbered its name to avoid replacing a file, and undo has to look
+    /// where the file really is.
+    pub fn amend_last_move(&mut self, id: &str, actual: PathBuf) {
+        if let Some(last) = self.history.last_mut() {
+            if last.kind == DecisionKind::File && last.id == id {
+                last.moved_to = Some(actual);
+            }
+        }
+    }
+
+    /// Takes back a filing whose move failed, so the session never claims
+    /// a move that didn't happen. Unlike undo, it leaves nothing to redo.
+    pub fn withdraw_last_move(&mut self, id: &str) {
+        if self.history.last().is_some_and(|d| d.kind == DecisionKind::File && d.id == id) {
+            let decision = self.history.pop().unwrap();
+            self.revert(&decision);
+        }
+    }
+
+    /// Reverts the most recent decision. Says what it was, so the interface
+    /// can bring the card back from the way it left, and what to move back
+    /// on disk if it was filed.
+    pub fn undo(&mut self) -> Option<Step> {
         let decision = self.history.pop()?;
         self.revert(&decision);
-        let kind = decision.kind;
+        let disk = self.disk_move(&decision, true);
+        let step = Step { kind: decision.kind, disk };
         self.redo_stack.push(decision);
-        Some(kind)
+        Some(step)
     }
 
     /// Re-applies the most recently undone decision.
-    pub fn redo(&mut self) -> Option<DecisionKind> {
+    pub fn redo(&mut self) -> Option<Step> {
         let decision = self.redo_stack.pop()?;
         self.apply(&decision);
-        let kind = decision.kind;
+        let disk = self.disk_move(&decision, false);
+        let step = Step { kind: decision.kind, disk };
         self.history.push(decision);
-        Some(kind)
+        Some(step)
+    }
+
+    /// The move that undoes (`back`) or redoes a filing.
+    fn disk_move(&self, decision: &Decision, back: bool) -> Option<DiskMove> {
+        let moved_to = decision.moved_to.clone()?;
+        let original = self.queue.iter().find(|c| c.id == decision.id)?.path.clone();
+        Some(if back {
+            DiskMove { from: moved_to, to: original }
+        } else {
+            DiskMove { from: original, to: moved_to }
+        })
     }
 
     /// Un-stages files the user unticked when reviewing the trash. They
@@ -198,6 +277,7 @@ impl TriageSession {
         match decision.kind {
             DecisionKind::Keep => self.set_decided(id, FileState::Kept),
             DecisionKind::Stage => self.set_decided(id, FileState::Staged),
+            DecisionKind::File => self.set_decided(id, FileState::Moved),
             DecisionKind::Skip => {
                 self.deferred.retain(|d| d != id);
                 self.deferred.push(id.clone());
@@ -208,7 +288,7 @@ impl TriageSession {
     fn revert(&mut self, decision: &Decision) {
         let id = &decision.id;
         match decision.kind {
-            DecisionKind::Keep | DecisionKind::Stage => {
+            DecisionKind::Keep | DecisionKind::Stage | DecisionKind::File => {
                 self.states.remove(id);
                 self.sorted = self.sorted.saturating_sub(1);
             }
@@ -227,7 +307,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    use DecisionKind::{Keep, Skip, Stage};
+    use DecisionKind::{File, Keep, Skip, Stage};
 
     fn session(names: &[&str]) -> TriageSession {
         TriageSession::new(
@@ -249,6 +329,14 @@ mod tests {
 
     fn current(s: &TriageSession) -> Option<&str> {
         s.current().map(|c| c.id.as_str())
+    }
+
+    fn undone(s: &mut TriageSession) -> Option<DecisionKind> {
+        s.undo().map(|step| step.kind)
+    }
+
+    fn redone(s: &mut TriageSession) -> Option<DecisionKind> {
+        s.redo().map(|step| step.kind)
     }
 
     #[test]
@@ -326,7 +414,7 @@ mod tests {
         s.decide(Skip);
         s.decide(Skip);
         assert_eq!(current(&s), Some("b"));
-        assert_eq!(s.undo(), Some(Keep));
+        assert_eq!(undone(&mut s), Some(Keep));
         assert!(!s.can_undo());
     }
 
@@ -334,7 +422,7 @@ mod tests {
     fn undo_reverts_a_keep() {
         let mut s = session(&["a", "b"]);
         s.decide(Keep);
-        assert_eq!(s.undo(), Some(Keep));
+        assert_eq!(undone(&mut s), Some(Keep));
         assert_eq!(s.state("a"), FileState::Pending);
         assert_eq!(current(&s), Some("a"));
     }
@@ -343,14 +431,14 @@ mod tests {
     fn undo_reverts_a_skip() {
         let mut s = session(&["a", "b"]);
         s.decide(Skip);
-        assert_eq!(s.undo(), Some(Skip));
+        assert_eq!(undone(&mut s), Some(Skip));
         assert_eq!(current(&s), Some("a"));
     }
 
     #[test]
     fn undo_with_no_history_does_nothing() {
         let mut s = session(&["a"]);
-        assert_eq!(s.undo(), None);
+        assert_eq!(undone(&mut s), None);
         assert_eq!(current(&s), Some("a"));
     }
 
@@ -359,9 +447,9 @@ mod tests {
         let mut s = session(&["a", "b", "c"]);
         s.decide(Keep);
         s.decide(Stage);
-        assert_eq!(s.undo(), Some(Stage));
+        assert_eq!(undone(&mut s), Some(Stage));
         assert_eq!(current(&s), Some("b"));
-        assert_eq!(s.undo(), Some(Keep));
+        assert_eq!(undone(&mut s), Some(Keep));
         assert_eq!(current(&s), Some("a"));
         assert!(!s.can_undo());
     }
@@ -378,11 +466,11 @@ mod tests {
         assert_eq!(current(&s), Some("a"));
         assert!(!s.can_undo());
 
-        assert_eq!(s.redo(), Some(Keep));
+        assert_eq!(redone(&mut s), Some(Keep));
         assert_eq!(s.state("a"), FileState::Kept);
-        assert_eq!(s.redo(), Some(Stage));
+        assert_eq!(redone(&mut s), Some(Stage));
         assert_eq!(s.state("b"), FileState::Staged);
-        assert_eq!(s.redo(), Some(Skip));
+        assert_eq!(redone(&mut s), Some(Skip));
         assert_eq!(current(&s), Some("d"));
         assert!(!s.can_redo());
     }
@@ -395,7 +483,85 @@ mod tests {
         assert!(s.can_redo());
         s.decide(Stage);
         assert!(!s.can_redo());
-        assert_eq!(s.redo(), None);
+        assert_eq!(redone(&mut s), None);
+    }
+
+    #[test]
+    fn filing_moves_the_file_out_of_the_queue() {
+        let mut s = session(&["a", "b"]);
+        let (id, path) = s.begin_file(PathBuf::from("Invoices/a")).unwrap();
+        assert_eq!((id.as_str(), path), ("a", PathBuf::from("a")));
+        assert_eq!(s.state("a"), FileState::Moved);
+        assert_eq!(current(&s), Some("b"));
+        assert_eq!(s.sorted_count(), 1);
+        assert!(s.staged().is_empty());
+    }
+
+    #[test]
+    fn decide_cannot_file_without_a_destination() {
+        let mut s = session(&["a"]);
+        assert!(!s.decide(File));
+        assert_eq!(s.state("a"), FileState::Pending);
+    }
+
+    #[test]
+    fn undoing_a_filing_asks_for_the_file_to_be_moved_back() {
+        let mut s = session(&["a", "b"]);
+        s.begin_file(PathBuf::from("Invoices/a"));
+        let step = s.undo().unwrap();
+        assert_eq!(step.kind, File);
+        assert_eq!(step.disk, Some(DiskMove { from: PathBuf::from("Invoices/a"), to: PathBuf::from("a") }));
+        assert_eq!(current(&s), Some("a"));
+        assert_eq!(s.sorted_count(), 0);
+    }
+
+    #[test]
+    fn redoing_a_filing_asks_for_the_file_to_be_moved_again() {
+        let mut s = session(&["a", "b"]);
+        s.begin_file(PathBuf::from("Invoices/a"));
+        s.undo();
+        let step = s.redo().unwrap();
+        assert_eq!(step.disk, Some(DiskMove { from: PathBuf::from("a"), to: PathBuf::from("Invoices/a") }));
+        assert_eq!(s.state("a"), FileState::Moved);
+    }
+
+    #[test]
+    fn other_decisions_need_no_disk_work() {
+        let mut s = session(&["a", "b"]);
+        s.decide(Keep);
+        assert_eq!(s.undo().unwrap().disk, None);
+    }
+
+    #[test]
+    fn amending_a_move_changes_where_undo_looks() {
+        let mut s = session(&["a", "b"]);
+        s.begin_file(PathBuf::from("Invoices/a"));
+        s.amend_last_move("a", PathBuf::from("Invoices/a (2)"));
+        assert_eq!(s.undo().unwrap().disk.unwrap().from, PathBuf::from("Invoices/a (2)"));
+    }
+
+    #[test]
+    fn withdrawing_a_failed_move_leaves_nothing_to_undo_or_redo() {
+        let mut s = session(&["a", "b"]);
+        s.decide(Keep);
+        s.begin_file(PathBuf::from("Invoices/b"));
+        s.withdraw_last_move("b");
+        assert_eq!(s.state("b"), FileState::Pending);
+        assert_eq!(current(&s), Some("b"));
+        assert!(!s.can_redo());
+        assert_eq!(s.sorted_count(), 1);
+        assert_eq!(undone(&mut s), Some(Keep));
+    }
+
+    #[test]
+    fn redo_after_a_failed_undo_puts_the_filing_back_on_record() {
+        let mut s = session(&["a", "b"]);
+        s.begin_file(PathBuf::from("Invoices/a"));
+        s.undo(); // pretend moving it back failed
+        s.redo();
+        assert_eq!(s.state("a"), FileState::Moved);
+        assert!(s.can_undo());
+        assert!(!s.can_redo());
     }
 
     #[test]
@@ -438,7 +604,7 @@ mod tests {
         let mut s = session(&["a", "b"]);
         s.decide(Stage);
         s.commit_trashed(["a"]);
-        assert_eq!(s.undo(), None);
+        assert_eq!(undone(&mut s), None);
         assert_eq!(current(&s), Some("b"));
         s.decide(Keep);
         assert_eq!(current(&s), None);
