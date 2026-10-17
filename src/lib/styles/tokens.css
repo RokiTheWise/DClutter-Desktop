@@ -1,0 +1,63 @@
+/*
+ * Design tokens, ported from DesignTokens.swift in the macOS app.
+ * Visual spec: docs/dclutter-design.md.
+ *
+ * The macOS app uses semantic system colours; these are the values those
+ * resolve to there, so both apps start from the same palette.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* Light: step the page down so a white card sits on it. */
+  --surface: #f1f1f1;
+  --card-surface: #ffffff;
+  --hairline: rgb(0 0 0 / 0.1);
+  --text-primary: rgb(0 0 0 / 0.85);
+  --text-secondary: rgb(0 0 0 / 0.5);
+  --text-tertiary: rgb(0 0 0 / 0.26);
+  /* Warm amber-red: reads as "consequential", not alarm-red. Trash only. */
+  --consequence: #c94f29;
+
+  --radius-chip: 6px;
+  --radius-preview: 10px;
+  --radius-card: 20px;
+  --radius-bin: 14px;
+  --radius-sheet: 12px;
+
+  --space-unit: 4px;
+  --space-small: 8px;
+  --space-medium: 12px;
+  --space-large: 16px;
+  --space-xlarge: 24px;
+  --space-xxlarge: 32px;
+  --space-card-margin: 48px;
+
+  /* SF Pro can't ship on Windows; Segoe UI Variable is the closest native match. */
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-display: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Dark: leave the page and lift the card. */
+    --surface: #1e1e1e;
+    --card-surface: #2a2a2a;
+    --hairline: rgb(255 255 255 / 0.1);
+    --text-primary: rgb(255 255 255 / 0.85);
+    --text-secondary: rgb(255 255 255 / 0.55);
+    --text-tertiary: rgb(255 255 255 / 0.25);
+    --consequence: #ed7a4f;
+  }
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--surface);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}

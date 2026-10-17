@@ -1,0 +1,14 @@
+[package]
+name = "dclutter-core"
+description = "Platform-independent queue scoring for DClutter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
