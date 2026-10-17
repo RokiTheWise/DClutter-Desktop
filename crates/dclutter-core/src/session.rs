@@ -10,15 +10,17 @@ use crate::FileCandidate;
 
 /// Where a file stands in the session.
 ///
-/// `Staged` means "marked for trash, not yet trashed". Trashing, moving and
-/// renaming arrive with file actions and add their own states, as in the
-/// macOS app.
+/// `Staged` means "marked for trash, not yet trashed". `Trashed` is the
+/// terminal state after the Recycle Bin took the file, kept distinct so
+/// undo can never bring back a card for a file that is gone. Moving and
+/// renaming add their own states later, as in the macOS app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FileState {
     Pending,
     Kept,
     Staged,
+    Trashed,
 }
 
 /// The three decisions the triage card offers.
@@ -54,6 +56,8 @@ pub struct TriageSession {
     /// Decisions undone and not yet re-applied. Any fresh decision clears
     /// it: branching discards the undone future.
     redo_stack: Vec<Decision>,
+    /// Decisions since the last commit. A commit is the natural checkpoint:
+    /// "67 sorted" means nothing once those files are gone.
     sorted: usize,
 }
 
@@ -99,10 +103,15 @@ impl TriageSession {
         self.queue.len()
     }
 
-    /// Kept or staged decisions this session. Skips don't count: a skipped
-    /// file still needs a decision.
+    /// Kept or staged decisions since the last commit. Skips don't count:
+    /// a skipped file still needs a decision.
     pub fn sorted_count(&self) -> usize {
         self.sorted
+    }
+
+    /// Files moved to the Recycle Bin this session.
+    pub fn trashed_count(&self) -> usize {
+        self.states.values().filter(|s| **s == FileState::Trashed).count()
     }
 
     /// Files marked for trash, in queue order.
@@ -152,6 +161,36 @@ impl TriageSession {
         let kind = decision.kind;
         self.history.push(decision);
         Some(kind)
+    }
+
+    /// Un-stages files the user unticked when reviewing the trash. They
+    /// become kept, not pending: unticking means "keep this one", not "ask
+    /// me again", so the file shouldn't come back as a card.
+    pub fn unstage<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
+        for id in ids {
+            if self.state(id) == FileState::Staged {
+                self.states.insert(id.to_owned(), FileState::Kept);
+            }
+        }
+    }
+
+    /// Records that these staged files are now in the Recycle Bin. Clears
+    /// undo and redo entirely: a trashed file can't be brought back by
+    /// undo, and older entries make no sense to reverse on their own once
+    /// the commit has closed the session.
+    pub fn commit_trashed<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
+        let mut trashed_any = false;
+        for id in ids {
+            if self.state(id) == FileState::Staged {
+                self.states.insert(id.to_owned(), FileState::Trashed);
+                trashed_any = true;
+            }
+        }
+        if trashed_any {
+            self.history.clear();
+            self.redo_stack.clear();
+            self.sorted = 0;
+        }
     }
 
     fn apply(&mut self, decision: &Decision) {
@@ -357,6 +396,64 @@ mod tests {
         s.decide(Stage);
         assert!(!s.can_redo());
         assert_eq!(s.redo(), None);
+    }
+
+    #[test]
+    fn committing_trashes_staged_files_and_closes_the_session() {
+        let mut s = session(&["a", "b", "c"]);
+        s.decide(Stage);
+        s.decide(Keep);
+        s.undo();
+        s.commit_trashed(["a"]);
+
+        assert_eq!(s.state("a"), FileState::Trashed);
+        assert_eq!(s.trashed_count(), 1);
+        assert!(s.staged().is_empty());
+        assert!(!s.can_undo());
+        assert!(!s.can_redo());
+        assert_eq!(s.sorted_count(), 0);
+        assert_eq!(s.remaining_count(), 2);
+    }
+
+    #[test]
+    fn committing_ignores_files_that_were_not_staged() {
+        let mut s = session(&["a", "b"]);
+        s.decide(Keep);
+        s.commit_trashed(["a", "b"]);
+        assert_eq!(s.state("a"), FileState::Kept);
+        assert_eq!(s.state("b"), FileState::Pending);
+    }
+
+    #[test]
+    fn committing_nothing_keeps_undo_history() {
+        let mut s = session(&["a", "b"]);
+        s.decide(Stage);
+        s.commit_trashed([]);
+        assert!(s.can_undo());
+        assert_eq!(s.sorted_count(), 1);
+    }
+
+    #[test]
+    fn a_trashed_file_never_comes_back() {
+        let mut s = session(&["a", "b"]);
+        s.decide(Stage);
+        s.commit_trashed(["a"]);
+        assert_eq!(s.undo(), None);
+        assert_eq!(current(&s), Some("b"));
+        s.decide(Keep);
+        assert_eq!(current(&s), None);
+    }
+
+    #[test]
+    fn unstaging_keeps_the_file_instead_of_requeueing_it() {
+        let mut s = session(&["a", "b"]);
+        s.decide(Stage);
+        s.decide(Keep);
+        s.unstage(["a", "b"]);
+        assert_eq!(s.state("a"), FileState::Kept);
+        assert_eq!(s.state("b"), FileState::Kept);
+        assert!(s.staged().is_empty());
+        assert_eq!(current(&s), None);
     }
 
     #[test]
