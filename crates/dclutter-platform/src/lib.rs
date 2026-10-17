@@ -7,6 +7,7 @@
 
 mod actions;
 mod destinations;
+mod locks;
 mod moves;
 mod scan;
 #[cfg_attr(not(windows), allow(dead_code))]

@@ -7,6 +7,10 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
+
+use crate::locks;
 
 #[derive(Debug)]
 pub enum TrashError {
@@ -14,6 +18,8 @@ pub enum TrashError {
     /// network share or a removable drive. Deleting there is permanent, so
     /// DClutter refuses rather than risk it.
     NoRecycleBin(PathBuf),
+    /// Another program still had the file open after a short wait.
+    InUse { path: PathBuf, apps: Vec<String> },
     Failed { path: PathBuf, reason: String },
 }
 
@@ -24,6 +30,12 @@ impl fmt::Display for TrashError {
                 f,
                 "{} is on a drive without a Recycle Bin, so DClutter won't delete it.",
                 display_name(path)
+            ),
+            Self::InUse { path, apps } => write!(
+                f,
+                "{} is open in {}. Close it there and try again.",
+                display_name(path),
+                locks::describe_apps(apps)
             ),
             Self::Failed { path, reason } => {
                 write!(f, "Couldn't move {} to the Recycle Bin: {reason}", display_name(path))
@@ -43,7 +55,17 @@ pub fn move_to_recycle_bin(path: &Path) -> Result<(), TrashError> {
     if !has_recycle_bin(path) {
         return Err(TrashError::NoRecycleBin(path.to_owned()));
     }
-    trash::delete(path).map_err(|e| TrashError::Failed { path: path.to_owned(), reason: e.to_string() })?;
+    if let Err(first) = trash::delete(path) {
+        // The shell doesn't say why it gave up, so ask who has the file
+        // open. If someone does, give a scan or sync a moment to let go.
+        if locks::apps_using(path).is_empty() {
+            return Err(TrashError::Failed { path: path.to_owned(), reason: first.to_string() });
+        }
+        thread::sleep(Duration::from_millis(1000));
+        if trash::delete(path).is_err() {
+            return Err(TrashError::InUse { path: path.to_owned(), apps: locks::apps_using(path) });
+        }
+    }
 
     // The shell can report success for an operation it quietly skipped;
     // only call it done once the file has actually left its folder.
@@ -111,6 +133,23 @@ mod tests {
         let err = move_to_recycle_bin(&dir.path().join("not-here.txt")).unwrap_err();
         assert!(matches!(err, TrashError::Failed { .. }));
         assert!(err.to_string().contains("not-here.txt"));
+    }
+
+    #[test]
+    fn a_file_held_open_is_reported_as_in_use_and_stays_put() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Transcript.pdf");
+        fs::write(&path, "x").unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+
+        let err = move_to_recycle_bin(&path).unwrap_err();
+        drop(held);
+
+        assert!(matches!(err, TrashError::InUse { .. }), "{err}");
+        assert!(err.to_string().starts_with("Transcript.pdf is open in "), "{err}");
+        assert!(path.exists());
     }
 
     /// Round trip through the real Recycle Bin: the file must leave its

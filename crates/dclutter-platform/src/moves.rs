@@ -9,12 +9,16 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::locks;
+
 #[derive(Debug)]
 pub enum MoveError {
     /// The destination folder is gone, renamed, or on a disconnected drive.
     DestinationUnavailable(PathBuf),
     /// Undo found something else at the file's original path.
     OriginalPathTaken(PathBuf),
+    /// Another program still had the file open after a short wait.
+    InUse { path: PathBuf, apps: Vec<String> },
     Failed { path: PathBuf, reason: String },
 }
 
@@ -30,6 +34,12 @@ impl fmt::Display for MoveError {
                 f,
                 "Something else named {} is in its old folder now, so it wasn't moved back.",
                 name_of(path)
+            ),
+            Self::InUse { path, apps } => write!(
+                f,
+                "{} is open in {}. Close it there and try again.",
+                name_of(path),
+                locks::describe_apps(apps)
             ),
             Self::Failed { path, reason } => write!(f, "Couldn't move {}: {reason}", name_of(path)),
         }
@@ -56,12 +66,12 @@ pub fn move_into_folder(path: &Path, folder: &Path) -> Result<PathBuf, MoveError
 
     for attempt in 1.. {
         let target = folder.join(numbered_name(Path::new(name), attempt));
-        match move_without_replacing(path, &target) {
+        match locks::retry_while_in_use(|| move_without_replacing(path, &target)) {
             Ok(()) => return Ok(target),
             // Taken: try the next number. Checking first and moving second
             // would race with anything else writing to the folder.
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(MoveError::Failed { path: path.to_owned(), reason: e.to_string() }),
+            Err(e) => return Err(failure(path, e)),
         }
     }
     unreachable!()
@@ -70,10 +80,18 @@ pub fn move_into_folder(path: &Path, folder: &Path) -> Result<PathBuf, MoveError
 /// Moves a filed file back to exactly where it was, for undo. Refuses if
 /// something else has taken that path in the meantime.
 pub fn move_back(from: &Path, to: &Path) -> Result<(), MoveError> {
-    move_without_replacing(from, to).map_err(|e| match e.kind() {
+    locks::retry_while_in_use(|| move_without_replacing(from, to)).map_err(|e| match e.kind() {
         io::ErrorKind::AlreadyExists => MoveError::OriginalPathTaken(to.to_owned()),
-        _ => MoveError::Failed { path: from.to_owned(), reason: e.to_string() },
+        _ => failure(from, e),
     })
+}
+
+fn failure(path: &Path, error: io::Error) -> MoveError {
+    if locks::is_in_use(&error) {
+        MoveError::InUse { path: path.to_owned(), apps: locks::apps_using(path) }
+    } else {
+        MoveError::Failed { path: path.to_owned(), reason: error.to_string() }
+    }
 }
 
 /// `Report.pdf` for attempt 1, then `Report (2).pdf`, `Report (3).pdf`.
@@ -212,6 +230,47 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&file).unwrap(), "report");
         assert!(!landed.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_held_open_is_reported_as_in_use_and_stays_put() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let f = folders();
+        let file = f.source.join("Transcript.pdf");
+        fs::write(&file, "x").unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(0).open(&file).unwrap();
+
+        let err = move_into_folder(&file, &f.destination).unwrap_err();
+        drop(held);
+
+        assert!(matches!(err, MoveError::InUse { .. }), "{err}");
+        assert!(err.to_string().starts_with("Transcript.pdf is open in "), "{err}");
+        assert!(err.to_string().ends_with("Close it there and try again."));
+        assert!(file.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_brief_lock_is_waited_out() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let f = folders();
+        let file = f.source.join("Fresh download.zip");
+        fs::write(&file, "x").unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(0).open(&file).unwrap();
+        // Like a virus scan: let go after a quarter of a second.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            drop(held);
+        });
+
+        let landed = move_into_folder(&file, &f.destination).unwrap();
+        release.join().unwrap();
+
+        assert!(landed.exists());
+        assert!(!file.exists());
     }
 
     #[test]
