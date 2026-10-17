@@ -68,7 +68,7 @@
   }}
   aria-labelledby="review-title"
 >
-  <h2 id="review-title">Move {files(count)} to the Recycle Bin?</h2>
+  <h2 id="review-title">Trash {files(count)}?</h2>
   <p class="subtitle">
     {#if unticked > 0}
       {unticked} unticked. Those stay where they are.
@@ -100,7 +100,7 @@
     <span class="spacer"></span>
     <button class="secondary" onclick={onCancel} disabled={busy}>Cancel</button>
     <button class="primary" onclick={confirm} disabled={busy || count === 0}>
-      {busy ? "Moving…" : `Move ${files(count)}`}
+      {busy ? "Trashing…" : `Trash ${files(count)}`}
     </button>
   </div>
 </dialog>

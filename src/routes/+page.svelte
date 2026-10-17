@@ -122,8 +122,8 @@
         view = outcome.view;
         if (outcome.trashed > 0) {
           status = outcome.trashed === 1
-            ? "Moved 1 file to the Recycle Bin."
-            : `Moved ${outcome.trashed} files to the Recycle Bin.`;
+            ? "Trashed 1 file."
+            : `Trashed ${outcome.trashed} files.`;
         }
         if (outcome.error) {
           // Keep the list open on what's left, which is what failed.
@@ -255,7 +255,7 @@
         tabindex="-1"
         onmousedown={(e) => e.preventDefault()}
         onclick={openReview}
-        title="Review staged files before moving them to the Recycle Bin  (Ctrl+Enter)"
+        title="Review staged files before trashing them  (Ctrl+Enter)"
       >
         <Icon name="tray" size={14} />
         Review trash
@@ -302,7 +302,7 @@
         <p class="status">{status}</p>
       {/if}
       <p class="counts">
-        <span class="strong">{view.remaining}</span> left · {view.sorted} sorted{#if view.trashed > 0}{` · ${view.trashed} in the Recycle Bin`}{/if}
+        <span class="strong">{view.remaining}</span> left · {view.sorted} sorted{#if view.trashed > 0}{` · ${view.trashed} trashed`}{/if}
       </p>
     </footer>
   </main>
