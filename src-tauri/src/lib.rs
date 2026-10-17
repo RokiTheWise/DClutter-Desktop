@@ -36,8 +36,30 @@ struct SessionView {
     total: usize,
     sorted: usize,
     staged: usize,
+    trashed: usize,
     can_undo: bool,
     can_redo: bool,
+}
+
+/// A staged file as the review-trash list shows it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StagedItem {
+    id: String,
+    name: String,
+    bytes: u64,
+    is_directory: bool,
+}
+
+/// What happened when the user confirmed the review-trash list.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitOutcome {
+    view: SessionView,
+    trashed: usize,
+    /// Set when one or more files couldn't be recycled. They stay staged,
+    /// so the list still shows them.
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -83,6 +105,7 @@ impl Triage {
             total: s.total_count(),
             sorted: s.sorted_count(),
             staged: s.staged().len(),
+            trashed: s.trashed_count(),
             can_undo: s.can_undo(),
             can_redo: s.can_redo(),
         }
@@ -156,6 +179,66 @@ fn redo(state: State<'_, AppState>) -> Result<Change, String> {
     Ok(Change { view: triage.view(), kind })
 }
 
+/// The files staged for trash, in queue order, for the review list.
+#[tauri::command]
+fn staged_files(state: State<'_, AppState>) -> Result<Vec<StagedItem>, String> {
+    let guard = state.0.lock().unwrap();
+    let triage = guard.as_ref().ok_or(NO_FOLDER)?;
+    Ok(triage
+        .session
+        .staged()
+        .into_iter()
+        .map(|c| StagedItem {
+            id: c.id.clone(),
+            name: c.file_name().to_owned(),
+            bytes: c.bytes,
+            is_directory: c.is_directory,
+        })
+        .collect())
+}
+
+/// Keeps the files the user unticked, then moves every other staged file
+/// to the Recycle Bin. Only ever acts on files the session has staged, so
+/// the interface can't name an arbitrary path to delete.
+#[tauri::command]
+async fn commit_trash(
+    state: State<'_, AppState>,
+    excluded: Vec<String>,
+) -> Result<CommitOutcome, String> {
+    let to_trash: Vec<(String, PathBuf)> = {
+        let mut guard = state.0.lock().unwrap();
+        let triage = guard.as_mut().ok_or(NO_FOLDER)?;
+        triage.session.unstage(excluded.iter().map(String::as_str));
+        triage.session.staged().into_iter().map(|c| (c.id.clone(), c.path.clone())).collect()
+    };
+
+    // Recycling can take a moment per file; keep it off the main thread
+    // and don't hold the session lock while the shell works.
+    let (trashed, errors) = tauri::async_runtime::spawn_blocking(move || {
+        let mut trashed = Vec::new();
+        let mut errors = Vec::new();
+        for (id, path) in to_trash {
+            match dclutter_platform::move_to_recycle_bin(&path) {
+                Ok(()) => trashed.push(id),
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        (trashed, errors)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut guard = state.0.lock().unwrap();
+    let triage = guard.as_mut().ok_or(NO_FOLDER)?;
+    triage.session.commit_trashed(trashed.iter().map(String::as_str));
+    let error = match errors.as_slice() {
+        [] => None,
+        [only] => Some(only.clone()),
+        [first, rest @ ..] => Some(format!("{first} ({} more couldn't be moved either.)", rest.len())),
+    };
+    Ok(CommitOutcome { view: triage.view(), trashed: trashed.len(), error })
+}
+
 /// Opens the file on the card in its default app. Takes no path, so the
 /// interface can only ever open the file it is showing.
 #[tauri::command]
@@ -175,7 +258,15 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![open_queue, decide, undo, redo, open_current])
+        .invoke_handler(tauri::generate_handler![
+            open_queue,
+            decide,
+            undo,
+            redo,
+            staged_files,
+            commit_trash,
+            open_current
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -28,6 +28,7 @@ export interface SessionView {
   total: number;
   sorted: number;
   staged: number;
+  trashed: number;
   canUndo: boolean;
   canRedo: boolean;
 }
@@ -53,6 +54,31 @@ export function undo(): Promise<Change> {
 
 export function redo(): Promise<Change> {
   return invoke("redo");
+}
+
+/** Mirrors `StagedItem` in src-tauri/src/lib.rs. */
+export interface StagedItem {
+  id: string;
+  name: string;
+  bytes: number;
+  isDirectory: boolean;
+}
+
+/** Mirrors `CommitOutcome` in src-tauri/src/lib.rs. */
+export interface CommitOutcome {
+  view: SessionView;
+  trashed: number;
+  error: string | null;
+}
+
+/** The files staged for trash, for the review list. */
+export function stagedFiles(): Promise<StagedItem[]> {
+  return invoke("staged_files");
+}
+
+/** Keeps the `excluded` files and recycles every other staged file. */
+export function commitTrash(excluded: string[]): Promise<CommitOutcome> {
+  return invoke("commit_trash", { excluded });
 }
 
 /** Opens the file on the card in its default app. */

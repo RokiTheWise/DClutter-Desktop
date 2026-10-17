@@ -6,9 +6,10 @@
   import Icon from "$lib/components/Icon.svelte";
   import IconButton from "$lib/components/IconButton.svelte";
   import { IMAGE_EXTENSIONS } from "$lib/components/Preview.svelte";
+  import ReviewTrash from "$lib/components/ReviewTrash.svelte";
   import { HeldDecision } from "$lib/held";
   import * as session from "$lib/session";
-  import type { DecisionKind, SessionView } from "$lib/session";
+  import type { DecisionKind, SessionView, StagedItem } from "$lib/session";
 
   type Exit = "left" | "right" | "fade";
   type Entrance = "rise" | "left" | "right";
@@ -18,6 +19,13 @@
   let loadError = $state<string | null>(null);
   /** Something went wrong mid-session; shown in the footer. */
   let notice = $state<string | null>(null);
+  /** What the last trash commit did; shown in the footer. */
+  let status = $state<string | null>(null);
+
+  /** The staged files while the review-trash list is open. */
+  let review = $state<StagedItem[] | null>(null);
+  let reviewBusy = $state(false);
+  let reviewError = $state<string | null>(null);
 
   // How the outgoing card leaves and the incoming one arrives. Set just
   // before `view` changes; Svelte reads them when the transitions start.
@@ -60,8 +68,9 @@
 
   /** Returns false when there's no card to decide on, ending a hold. */
   function makeDecision(kind: DecisionKind): boolean {
-    if (!view?.current) return false;
+    if (!view?.current || review) return false;
     notice = null;
+    status = null;
     enqueue(async () => {
       const next = await session.decide(kind);
       exit = exitFor(kind);
@@ -95,6 +104,44 @@
     });
   }
 
+  function openReview() {
+    if (!view || view.staged === 0 || review) return;
+    held.stop();
+    notice = null;
+    enqueue(async () => {
+      reviewError = null;
+      review = await session.stagedFiles();
+    });
+  }
+
+  function confirmReview(excluded: string[]) {
+    reviewBusy = true;
+    enqueue(async () => {
+      try {
+        const outcome = await session.commitTrash(excluded);
+        view = outcome.view;
+        if (outcome.trashed > 0) {
+          status = outcome.trashed === 1
+            ? "Trashed 1 file."
+            : `Trashed ${outcome.trashed} files.`;
+        }
+        if (outcome.error) {
+          // Keep the list open on what's left, which is what failed.
+          reviewError = outcome.error;
+          review = await session.stagedFiles();
+          if (review.length === 0) review = null;
+        } else {
+          review = null;
+        }
+      } catch (e) {
+        // Show it in the list, not in the footer hidden behind it.
+        reviewError = String(e);
+      } finally {
+        reviewBusy = false;
+      }
+    });
+  }
+
   function open() {
     if (!view?.current) return;
     session.openCurrent().catch((e) => {
@@ -103,7 +150,8 @@
   }
 
   function onkeydown(e: KeyboardEvent) {
-    if (!view) return;
+    // The review list handles its own keys while it's open.
+    if (!view || review) return;
 
     if ((e.ctrlKey || e.metaKey) && !e.altKey) {
       const key = e.key.toLowerCase();
@@ -113,6 +161,9 @@
       } else if (key === "y") {
         e.preventDefault();
         redo();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        openReview();
       }
       return;
     }
@@ -197,7 +248,15 @@
         <IconButton title="Redo" icon="redo" shortcut="Ctrl+Shift+Z or Ctrl+Y" disabled={!view.canRedo} onclick={redo} />
       </div>
 
-      <button class="review" class:has-staged={view.staged > 0} disabled tabindex="-1" title="Reviewing and trashing staged files comes with file actions">
+      <button
+        class="review"
+        class:has-staged={view.staged > 0}
+        disabled={view.staged === 0}
+        tabindex="-1"
+        onmousedown={(e) => e.preventDefault()}
+        onclick={openReview}
+        title="Review staged files before trashing them  (Ctrl+Enter)"
+      >
         <Icon name="tray" size={14} />
         Review trash
         <span class="count">{view.staged}</span>
@@ -239,11 +298,24 @@
       {#if notice}
         <p class="notice">{notice}</p>
       {/if}
+      {#if status}
+        <p class="status">{status}</p>
+      {/if}
       <p class="counts">
-        <span class="strong">{view.remaining}</span> left · {view.sorted} sorted
+        <span class="strong">{view.remaining}</span> left · {view.sorted} sorted{#if view.trashed > 0}{` · ${view.trashed} trashed`}{/if}
       </p>
     </footer>
   </main>
+
+  {#if review}
+    <ReviewTrash
+      items={review}
+      busy={reviewBusy}
+      error={reviewError}
+      onCancel={() => (review = null)}
+      onConfirm={confirmReview}
+    />
+  {/if}
 {/if}
 
 <style>
@@ -305,6 +377,14 @@
     font-size: 12px;
     font-weight: 500;
     white-space: nowrap;
+  }
+
+  .review:not(:disabled) {
+    cursor: pointer;
+  }
+
+  .review:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--consequence) 16%, transparent);
   }
 
   .review.has-staged {
@@ -372,6 +452,12 @@
 
   .strong {
     color: var(--text-primary);
+  }
+
+  .status {
+    margin-bottom: var(--space-small) !important;
+    color: var(--text-secondary);
+    font-size: 12px !important;
   }
 
   .notice {
