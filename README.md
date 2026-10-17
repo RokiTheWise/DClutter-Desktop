@@ -20,6 +20,7 @@ ships inside the app and every file operation happens on your machine.
 | Path | What's there |
 |---|---|
 | `crates/dclutter-core` | Queue scoring, duplicate and extracted-archive detection. Pure Rust, no Windows APIs. |
+| `crates/dclutter-platform` | Reads a folder into candidates: sizes, dates, and the download source from each file's `Zone.Identifier` stream. |
 | `src-tauri` | The desktop app shell: windows, commands, filesystem access. |
 | `src` | The interface (SvelteKit + TypeScript). Design tokens live in `src/lib/styles/tokens.css`. |
 | `fixtures` | Scoring cases shared with the macOS app. See [fixtures/README.md](fixtures/README.md). |
@@ -42,6 +43,13 @@ Run the scoring tests:
 
 ```bash
 cargo test -p dclutter-core
+```
+
+Print a folder's queue from the command line, to check scores against real
+files (the number is how many rows to show):
+
+```bash
+cargo run -p dclutter-platform --example rank -- "%USERPROFILE%\Downloads" 20
 ```
 
 Build the installers (`.exe` and `.msi`, in `target/release/bundle`):
