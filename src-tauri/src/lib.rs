@@ -2,42 +2,109 @@
 //  Copyright 2026 Dexter Jethro Enriquez
 //  Licensed under the Apache License, Version 2.0.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
-use dclutter_core::{FileCandidate, QueueContext, QueueScorer, ScoreWeights};
+use dclutter_core::{
+    DecisionKind, FileCandidate, QueueContext, QueueScorer, ScoreWeights, TriageSession,
+};
 use serde::Serialize;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, State};
+use tauri_plugin_opener::OpenerExt;
 
-/// A folder's contents in triage order, as the interface shows them.
+/// The folder being triaged, with the facts its cards are drawn from.
+struct Triage {
+    folder: PathBuf,
+    session: TriageSession,
+    context: QueueContext,
+    scores: HashMap<String, f64>,
+}
+
+#[derive(Default)]
+struct AppState(Mutex<Option<Triage>>);
+
+/// Everything the triage screen shows, sent after every change.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Queue {
+struct SessionView {
     folder: PathBuf,
-    items: Vec<QueueItem>,
+    current: Option<CardItem>,
+    /// Sent ahead so the interface can preload its preview.
+    up_next: Option<CardItem>,
+    remaining: usize,
+    total: usize,
+    sorted: usize,
+    staged: usize,
+    can_undo: bool,
+    can_redo: bool,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct QueueItem {
+struct CardItem {
     #[serde(flatten)]
     candidate: FileCandidate,
     name: String,
+    extension: String,
     score: f64,
     duplicate_count: usize,
-    redundant_copy: bool,
     extracted_archive: bool,
 }
 
+/// A view plus the decision an undo or redo just reversed or re-applied,
+/// so the card can return from the side it left by.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Change {
+    view: SessionView,
+    kind: Option<DecisionKind>,
+}
+
+impl Triage {
+    fn card(&self, candidate: &FileCandidate) -> CardItem {
+        CardItem {
+            name: candidate.file_name().to_owned(),
+            extension: candidate.extension().to_lowercase(),
+            score: self.scores.get(&candidate.id).copied().unwrap_or_default(),
+            duplicate_count: self.context.duplicate_count(candidate),
+            extracted_archive: self.context.is_extracted_archive(candidate),
+            candidate: candidate.clone(),
+        }
+    }
+
+    fn view(&self) -> SessionView {
+        let s = &self.session;
+        SessionView {
+            folder: self.folder.clone(),
+            current: s.current().map(|c| self.card(c)),
+            up_next: s.up_next().map(|c| self.card(c)),
+            remaining: s.remaining_count(),
+            total: s.total_count(),
+            sorted: s.sorted_count(),
+            staged: s.staged().len(),
+            can_undo: s.can_undo(),
+            can_redo: s.can_redo(),
+        }
+    }
+}
+
+const NO_FOLDER: &str = "No folder is open";
+
 /// Scans `folder`, or the user's Downloads folder when none is given, and
-/// returns its items ranked highest score first.
+/// starts a fresh triage session on it.
 #[tauri::command]
-async fn scan_folder(app: AppHandle, folder: Option<PathBuf>) -> Result<Queue, String> {
+async fn open_queue(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    folder: Option<PathBuf>,
+) -> Result<SessionView, String> {
     let folder = match folder {
         Some(folder) => folder,
         None => app.path().download_dir().map_err(|e| e.to_string())?,
     };
 
-    tauri::async_runtime::spawn_blocking(move || {
+    let triage = tauri::async_runtime::spawn_blocking(move || {
         let candidates = dclutter_platform::candidates_in(&folder)
             .map_err(|e| format!("Couldn't read {}: {e}", folder.display()))?;
         let now = std::time::SystemTime::now()
@@ -45,30 +112,70 @@ async fn scan_folder(app: AppHandle, folder: Option<PathBuf>) -> Result<Queue, S
             .map_err(|e| e.to_string())?
             .as_secs_f64();
 
-        let ctx = QueueContext::new(&candidates);
-        let items = QueueScorer::rank(candidates, now, &ScoreWeights::default())
-            .into_iter()
-            .map(|scored| QueueItem {
-                name: scored.candidate.file_name().to_owned(),
-                duplicate_count: ctx.duplicate_count(&scored.candidate),
-                redundant_copy: ctx.is_redundant_copy(&scored.candidate),
-                extracted_archive: ctx.is_extracted_archive(&scored.candidate),
-                score: scored.score,
-                candidate: scored.candidate,
-            })
-            .collect();
-
-        Ok(Queue { folder, items })
+        let context = QueueContext::new(&candidates);
+        let ranked = QueueScorer::rank(candidates, now, &ScoreWeights::default());
+        let scores = ranked.iter().map(|s| (s.candidate.id.clone(), s.score)).collect();
+        let session = TriageSession::new(ranked.into_iter().map(|s| s.candidate).collect());
+        Ok::<_, String>(Triage { folder, session, context, scores })
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+
+    // Lets the interface load image previews straight from this folder,
+    // and nothing outside it.
+    app.asset_protocol_scope()
+        .allow_directory(&triage.folder, false)
+        .map_err(|e| e.to_string())?;
+
+    let view = triage.view();
+    *state.0.lock().unwrap() = Some(triage);
+    Ok(view)
+}
+
+#[tauri::command]
+fn decide(state: State<'_, AppState>, kind: DecisionKind) -> Result<SessionView, String> {
+    let mut guard = state.0.lock().unwrap();
+    let triage = guard.as_mut().ok_or(NO_FOLDER)?;
+    triage.session.decide(kind);
+    Ok(triage.view())
+}
+
+#[tauri::command]
+fn undo(state: State<'_, AppState>) -> Result<Change, String> {
+    let mut guard = state.0.lock().unwrap();
+    let triage = guard.as_mut().ok_or(NO_FOLDER)?;
+    let kind = triage.session.undo();
+    Ok(Change { view: triage.view(), kind })
+}
+
+#[tauri::command]
+fn redo(state: State<'_, AppState>) -> Result<Change, String> {
+    let mut guard = state.0.lock().unwrap();
+    let triage = guard.as_mut().ok_or(NO_FOLDER)?;
+    let kind = triage.session.redo();
+    Ok(Change { view: triage.view(), kind })
+}
+
+/// Opens the file on the card in its default app. Takes no path, so the
+/// interface can only ever open the file it is showing.
+#[tauri::command]
+fn open_current(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let path = {
+        let guard = state.0.lock().unwrap();
+        let triage = guard.as_ref().ok_or(NO_FOLDER)?;
+        triage.session.current().ok_or("Nothing to open")?.path.clone()
+    };
+    app.opener()
+        .open_path(path.to_string_lossy(), None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![scan_folder])
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![open_queue, decide, undo, redo, open_current])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

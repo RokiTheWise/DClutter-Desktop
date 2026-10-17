@@ -18,6 +18,10 @@
   --text-tertiary: rgb(0 0 0 / 0.26);
   /* Warm amber-red: reads as "consequential", not alarm-red. Trash only. */
   --consequence: #c94f29;
+  /* Quiet fills for controls and chips: the text colour at low opacity. */
+  --fill-subtle: rgb(0 0 0 / 0.035);
+  --fill-hover: rgb(0 0 0 / 0.09);
+  --fill-chip: rgb(0 0 0 / 0.08);
 
   --radius-chip: 6px;
   --radius-preview: 10px;
@@ -36,6 +40,12 @@
   /* SF Pro can't ship on Windows; Segoe UI Variable is the closest native match. */
   --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   --font-display: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  /* The "instrumentation" voice for metadata labels; SF Mono on macOS. */
+  --font-mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+
+  /* Scales with the window so the card, controls and footer always fit;
+     300px at the default 880px height, as on macOS. */
+  --preview-height: clamp(140px, calc(100vh - 580px), 440px);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -48,6 +58,9 @@
     --text-secondary: rgb(255 255 255 / 0.55);
     --text-tertiary: rgb(255 255 255 / 0.25);
     --consequence: #ed7a4f;
+    --fill-subtle: rgb(255 255 255 / 0.035);
+    --fill-hover: rgb(255 255 255 / 0.09);
+    --fill-chip: rgb(255 255 255 / 0.08);
   }
 }
 
