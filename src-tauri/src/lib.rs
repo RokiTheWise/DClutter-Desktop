@@ -11,7 +11,7 @@ use dclutter_core::{
 };
 use dclutter_platform::{Destination, DestinationStore, MAX_DESTINATIONS};
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
@@ -389,6 +389,31 @@ fn open_current(app: AppHandle, state: State<'_, AppState>) -> Result<(), String
         .map_err(|e| e.to_string())
 }
 
+/// Shrinks the window to fit the screen it opens on, minus the taskbar,
+/// and centres it there. The default 716 × 880 suits the triage card, but
+/// on a laptop at 125–150% scaling it's taller than the usable area, and
+/// the decision buttons would open underneath the taskbar.
+fn fit_to_work_area(window: &WebviewWindow) -> tauri::Result<()> {
+    let Some(monitor) = window.current_monitor()?.or(window.primary_monitor()?) else {
+        return Ok(());
+    };
+    let area = monitor.work_area();
+    let (outer, inner) = (window.outer_size()?, window.inner_size()?);
+    // The title bar and borders, which set_size doesn't include.
+    let frame = PhysicalSize::new(outer.width - inner.width, outer.height - inner.height);
+    let margin = (12.0 * monitor.scale_factor()).round() as u32;
+
+    let width = outer.width.min(area.size.width.saturating_sub(2 * margin));
+    let height = outer.height.min(area.size.height.saturating_sub(2 * margin));
+    if (width, height) != (outer.width, outer.height) {
+        window.set_size(PhysicalSize::new(width - frame.width, height - frame.height))?;
+    }
+    window.set_position(PhysicalPosition::new(
+        area.position.x + ((area.size.width - width) / 2) as i32,
+        area.position.y + ((area.size.height - height) / 2) as i32,
+    ))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -401,6 +426,13 @@ pub fn run() {
                 destinations: Mutex::new(store.load()),
                 store,
             });
+            // The window starts hidden so it never shows at the wrong size.
+            if let Some(window) = app.get_webview_window("main") {
+                if let Err(e) = fit_to_work_area(&window) {
+                    eprintln!("Couldn't fit the window to the screen: {e}");
+                }
+                window.show()?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
