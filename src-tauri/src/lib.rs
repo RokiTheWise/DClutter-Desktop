@@ -183,7 +183,9 @@ fn decide(state: State<'_, AppState>, kind: DecisionKind) -> Result<SessionView,
     Ok(triage.view())
 }
 
-#[tauri::command]
+// `async` runs these off the main thread: moving a filed file back can
+// wait out a lock or copy across drives, and must not freeze the window.
+#[tauri::command(async)]
 fn undo(state: State<'_, AppState>) -> Result<Change, String> {
     let mut guard = state.triage.lock().unwrap();
     let triage = guard.as_mut().ok_or(NO_FOLDER)?;
@@ -198,7 +200,7 @@ fn undo(state: State<'_, AppState>) -> Result<Change, String> {
     Ok(Change { view: triage.view(), kind: step.map(|s| s.kind) })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn redo(state: State<'_, AppState>) -> Result<Change, String> {
     let mut guard = state.triage.lock().unwrap();
     let triage = guard.as_mut().ok_or(NO_FOLDER)?;
