@@ -12,7 +12,9 @@
 mod candidate;
 mod context;
 mod scorer;
+mod session;
 
 pub use candidate::{FileCandidate, Timestamp};
 pub use context::QueueContext;
 pub use scorer::{QueueScorer, ScoreWeights, ScoredCandidate};
+pub use session::{DecisionKind, FileState, TriageSession};
