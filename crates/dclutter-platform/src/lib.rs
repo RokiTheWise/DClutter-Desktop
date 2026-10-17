@@ -6,11 +6,13 @@
 //! `DirectoryMetadataProvider` and `FileActions` from the macOS app.
 
 mod actions;
+mod destinations;
 mod moves;
 mod scan;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod zone_identifier;
 
 pub use actions::{TrashError, move_to_recycle_bin};
+pub use destinations::{Destination, DestinationStore, MAX_DESTINATIONS};
 pub use moves::{MoveError, move_back, move_into_folder};
 pub use scan::{UNKNOWN_INTERNET_SOURCE, candidates_in};

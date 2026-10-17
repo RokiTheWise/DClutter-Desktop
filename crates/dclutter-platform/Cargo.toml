@@ -1,6 +1,6 @@
 [package]
 name = "dclutter-platform"
-description = "Filesystem access for DClutter: reading folders and recycling files"
+description = "Filesystem access for DClutter: reading folders, filing and recycling files"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,8 @@ authors.workspace = true
 [dependencies]
 dclutter-core = { path = "../dclutter-core" }
 trash = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

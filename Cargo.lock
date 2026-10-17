@@ -685,6 +685,8 @@ name = "dclutter-platform"
 version = "0.1.0"
 dependencies = [
  "dclutter-core",
+ "serde",
+ "serde_json",
  "tempfile",
  "trash",
  "windows-sys 0.61.2",
