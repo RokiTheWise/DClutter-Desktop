@@ -302,8 +302,7 @@
         <p class="status">{status}</p>
       {/if}
       <p class="counts">
-        <span class="strong">{view.remaining}</span> left · {view.sorted} sorted{#if view.trashed > 0}
-          · {view.trashed} in the Recycle Bin{/if}
+        <span class="strong">{view.remaining}</span> left · {view.sorted} sorted{#if view.trashed > 0}{` · ${view.trashed} in the Recycle Bin`}{/if}
       </p>
     </footer>
   </main>
