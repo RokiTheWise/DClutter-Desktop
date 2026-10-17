@@ -7,10 +7,12 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use dclutter_core::{
-    DecisionKind, FileCandidate, QueueContext, QueueScorer, ScoreWeights, TriageSession,
+    DecisionKind, FileCandidate, QueueContext, QueueScorer, ScoreWeights, Step, TriageSession,
 };
+use dclutter_platform::{Destination, DestinationStore, MAX_DESTINATIONS};
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
 /// The folder being triaged, with the facts its cards are drawn from.
@@ -21,8 +23,11 @@ struct Triage {
     scores: HashMap<String, f64>,
 }
 
-#[derive(Default)]
-struct AppState(Mutex<Option<Triage>>);
+struct AppState {
+    triage: Mutex<Option<Triage>>,
+    destinations: Mutex<Vec<Destination>>,
+    store: DestinationStore,
+}
 
 /// Everything the triage screen shows, sent after every change.
 #[derive(Serialize)]
@@ -72,6 +77,21 @@ struct CardItem {
     score: f64,
     duplicate_count: usize,
     extracted_archive: bool,
+}
+
+/// A destination bin on the shelf.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DestinationItem {
+    id: String,
+    name: String,
+    path: PathBuf,
+}
+
+impl From<&Destination> for DestinationItem {
+    fn from(d: &Destination) -> Self {
+        Self { id: d.id.clone(), name: d.name.clone(), path: d.path.clone() }
+    }
 }
 
 /// A view plus the decision an undo or redo just reversed or re-applied,
@@ -151,38 +171,60 @@ async fn open_queue(
         .map_err(|e| e.to_string())?;
 
     let view = triage.view();
-    *state.0.lock().unwrap() = Some(triage);
+    *state.triage.lock().unwrap() = Some(triage);
     Ok(view)
 }
 
 #[tauri::command]
 fn decide(state: State<'_, AppState>, kind: DecisionKind) -> Result<SessionView, String> {
-    let mut guard = state.0.lock().unwrap();
+    let mut guard = state.triage.lock().unwrap();
     let triage = guard.as_mut().ok_or(NO_FOLDER)?;
     triage.session.decide(kind);
     Ok(triage.view())
 }
 
-#[tauri::command]
+// `async` runs these off the main thread: moving a filed file back can
+// wait out a lock or copy across drives, and must not freeze the window.
+#[tauri::command(async)]
 fn undo(state: State<'_, AppState>) -> Result<Change, String> {
-    let mut guard = state.0.lock().unwrap();
+    let mut guard = state.triage.lock().unwrap();
     let triage = guard.as_mut().ok_or(NO_FOLDER)?;
-    let kind = triage.session.undo();
-    Ok(Change { view: triage.view(), kind })
+    let step = triage.session.undo();
+    if let Err(e) = carry_out(&step) {
+        // The file is still in the destination, so put the filing back on
+        // record; a card for a file that isn't in the folder would fail at
+        // every action.
+        triage.session.redo();
+        return Err(format!("{e} It's still filed."));
+    }
+    Ok(Change { view: triage.view(), kind: step.map(|s| s.kind) })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn redo(state: State<'_, AppState>) -> Result<Change, String> {
-    let mut guard = state.0.lock().unwrap();
+    let mut guard = state.triage.lock().unwrap();
     let triage = guard.as_mut().ok_or(NO_FOLDER)?;
-    let kind = triage.session.redo();
-    Ok(Change { view: triage.view(), kind })
+    let step = triage.session.redo();
+    if let Err(e) = carry_out(&step) {
+        triage.session.undo();
+        return Err(e.to_string());
+    }
+    Ok(Change { view: triage.view(), kind: step.map(|s| s.kind) })
+}
+
+/// Moves a filed file back or forward for an undo or redo. Uses the exact
+/// recorded paths and never replaces whatever is there now.
+fn carry_out(step: &Option<Step>) -> Result<(), dclutter_platform::MoveError> {
+    match step.as_ref().and_then(|s| s.disk.as_ref()) {
+        Some(disk) => dclutter_platform::move_back(&disk.from, &disk.to),
+        None => Ok(()),
+    }
 }
 
 /// The files staged for trash, in queue order, for the review list.
 #[tauri::command]
 fn staged_files(state: State<'_, AppState>) -> Result<Vec<StagedItem>, String> {
-    let guard = state.0.lock().unwrap();
+    let guard = state.triage.lock().unwrap();
     let triage = guard.as_ref().ok_or(NO_FOLDER)?;
     Ok(triage
         .session
@@ -206,7 +248,7 @@ async fn commit_trash(
     excluded: Vec<String>,
 ) -> Result<CommitOutcome, String> {
     let to_trash: Vec<(String, PathBuf)> = {
-        let mut guard = state.0.lock().unwrap();
+        let mut guard = state.triage.lock().unwrap();
         let triage = guard.as_mut().ok_or(NO_FOLDER)?;
         triage.session.unstage(excluded.iter().map(String::as_str));
         triage.session.staged().into_iter().map(|c| (c.id.clone(), c.path.clone())).collect()
@@ -228,7 +270,7 @@ async fn commit_trash(
     .await
     .map_err(|e| e.to_string())?;
 
-    let mut guard = state.0.lock().unwrap();
+    let mut guard = state.triage.lock().unwrap();
     let triage = guard.as_mut().ok_or(NO_FOLDER)?;
     triage.session.commit_trashed(trashed.iter().map(String::as_str));
     let error = match errors.as_slice() {
@@ -239,12 +281,106 @@ async fn commit_trash(
     Ok(CommitOutcome { view: triage.view(), trashed: trashed.len(), error })
 }
 
+/// The destination folders, in shelf order.
+#[tauri::command]
+fn list_destinations(state: State<'_, AppState>) -> Vec<DestinationItem> {
+    state.destinations.lock().unwrap().iter().map(DestinationItem::from).collect()
+}
+
+/// Asks the user for a folder with the system picker, which can also make
+/// a new one, and adds it to the shelf. Returns the new list, unchanged if
+/// the picker was cancelled.
+#[tauri::command]
+async fn add_destination(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<DestinationItem>, String> {
+    if state.destinations.lock().unwrap().len() >= MAX_DESTINATIONS {
+        return Err(
+            "Three folders is the maximum. Highlight one on the shelf and press Delete to free a slot.".into(),
+        );
+    }
+
+    // The folder you need often doesn't exist yet; you realise it the
+    // moment a file demands one. The Windows picker's New folder button
+    // covers that without sending anyone to Explorer.
+    let picked = app.dialog().file().set_title("Choose a folder to file into").blocking_pick_folder();
+    let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
+        return Ok(list_destinations(state));
+    };
+
+    let open_folder = state.triage.lock().unwrap().as_ref().map(|t| t.folder.clone());
+    if open_folder.is_some_and(|folder| Destination::new(folder).is_folder(&path)) {
+        return Err("That's the folder you're sorting. Choose somewhere to file things into.".into());
+    }
+
+    let mut destinations = state.destinations.lock().unwrap();
+    if destinations.iter().any(|d| d.is_folder(&path)) {
+        return Err(format!("{} is already on the shelf.", Destination::new(path).name));
+    }
+    destinations.push(Destination::new(path));
+    state.store.save(&destinations).map_err(|e| format!("Couldn't save your folders: {e}"))?;
+    Ok(destinations.iter().map(DestinationItem::from).collect())
+}
+
+/// Takes a folder off the shelf. The folder itself, and anything already
+/// filed into it, are left alone.
+#[tauri::command]
+fn remove_destination(state: State<'_, AppState>, id: String) -> Result<Vec<DestinationItem>, String> {
+    let mut destinations = state.destinations.lock().unwrap();
+    destinations.retain(|d| d.id != id);
+    state.store.save(&destinations).map_err(|e| format!("Couldn't save your folders: {e}"))?;
+    Ok(destinations.iter().map(DestinationItem::from).collect())
+}
+
+/// Files the current card's file into the destination `id`, at once.
+/// The move is recorded before the file is touched, so it can always be
+/// undone; if the move fails, the record is withdrawn.
+#[tauri::command]
+async fn file_current(state: State<'_, AppState>, id: String) -> Result<SessionView, String> {
+    let folder = state
+        .destinations
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|d| d.id == id)
+        .map(|d| d.path.clone())
+        .ok_or("That folder is no longer on the shelf.")?;
+
+    let (file_id, path) = {
+        let mut guard = state.triage.lock().unwrap();
+        let triage = guard.as_mut().ok_or(NO_FOLDER)?;
+        let current = triage.session.current().ok_or("Nothing to file")?;
+        let planned = folder.join(current.file_name());
+        triage.session.begin_file(planned).ok_or("Nothing to file")?
+    };
+
+    // A move to another drive is a copy, which can take a while for big
+    // files; don't hold the session or the main thread meanwhile.
+    let moved = {
+        let (path, folder) = (path.clone(), folder.clone());
+        tauri::async_runtime::spawn_blocking(move || dclutter_platform::move_into_folder(&path, &folder))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    let mut guard = state.triage.lock().unwrap();
+    let triage = guard.as_mut().ok_or(NO_FOLDER)?;
+    match moved {
+        Ok(landed) => {
+            triage.session.amend_last_move(&file_id, landed);
+            Ok(triage.view())
+        }
+        Err(e) => {
+            triage.session.withdraw_last_move(&file_id);
+            Err(e.to_string())
+        }
+    }
+}
+
 /// Opens the file on the card in its default app. Takes no path, so the
 /// interface can only ever open the file it is showing.
 #[tauri::command]
 fn open_current(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let path = {
-        let guard = state.0.lock().unwrap();
+        let guard = state.triage.lock().unwrap();
         let triage = guard.as_ref().ok_or(NO_FOLDER)?;
         triage.session.current().ok_or("Nothing to open")?.path.clone()
     };
@@ -253,11 +389,52 @@ fn open_current(app: AppHandle, state: State<'_, AppState>) -> Result<(), String
         .map_err(|e| e.to_string())
 }
 
+/// Shrinks the window to fit the screen it opens on, minus the taskbar,
+/// and centres it there. The default 716 × 880 suits the triage card, but
+/// on a laptop at 125–150% scaling it's taller than the usable area, and
+/// the decision buttons would open underneath the taskbar.
+fn fit_to_work_area(window: &WebviewWindow) -> tauri::Result<()> {
+    let Some(monitor) = window.current_monitor()?.or(window.primary_monitor()?) else {
+        return Ok(());
+    };
+    let area = monitor.work_area();
+    let (outer, inner) = (window.outer_size()?, window.inner_size()?);
+    // The title bar and borders, which set_size doesn't include.
+    let frame = PhysicalSize::new(outer.width - inner.width, outer.height - inner.height);
+    let margin = (12.0 * monitor.scale_factor()).round() as u32;
+
+    let width = outer.width.min(area.size.width.saturating_sub(2 * margin));
+    let height = outer.height.min(area.size.height.saturating_sub(2 * margin));
+    if (width, height) != (outer.width, outer.height) {
+        window.set_size(PhysicalSize::new(width - frame.width, height - frame.height))?;
+    }
+    window.set_position(PhysicalPosition::new(
+        area.position.x + ((area.size.width - width) / 2) as i32,
+        area.position.y + ((area.size.height - height) / 2) as i32,
+    ))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState::default())
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let store = DestinationStore::new(app.path().app_config_dir()?.join("destinations.json"));
+            app.manage(AppState {
+                triage: Mutex::new(None),
+                destinations: Mutex::new(store.load()),
+                store,
+            });
+            // The window starts hidden so it never shows at the wrong size.
+            if let Some(window) = app.get_webview_window("main") {
+                if let Err(e) = fit_to_work_area(&window) {
+                    eprintln!("Couldn't fit the window to the screen: {e}");
+                }
+                window.show()?;
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             open_queue,
             decide,
@@ -265,6 +442,10 @@ pub fn run() {
             redo,
             staged_files,
             commit_trash,
+            list_destinations,
+            add_destination,
+            remove_destination,
+            file_current,
             open_current
         ])
         .run(tauri::generate_context!())

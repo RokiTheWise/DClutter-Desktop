@@ -1,18 +1,20 @@
 <script lang="ts">
   import { convertFileSrc } from "@tauri-apps/api/core";
   import { cubicIn, cubicOut } from "svelte/easing";
+  import { fly } from "svelte/transition";
   import Card from "$lib/components/Card.svelte";
   import DecisionButton from "$lib/components/DecisionButton.svelte";
+  import DestinationShelf from "$lib/components/DestinationShelf.svelte";
   import Icon from "$lib/components/Icon.svelte";
   import IconButton from "$lib/components/IconButton.svelte";
   import { IMAGE_EXTENSIONS } from "$lib/components/Preview.svelte";
   import ReviewTrash from "$lib/components/ReviewTrash.svelte";
   import { HeldDecision } from "$lib/held";
   import * as session from "$lib/session";
-  import type { DecisionKind, SessionView, StagedItem } from "$lib/session";
+  import type { DecisionKind, DestinationItem, SessionView, StagedItem } from "$lib/session";
 
-  type Exit = "left" | "right" | "fade";
-  type Entrance = "rise" | "left" | "right";
+  type Exit = "left" | "right" | "up" | "fade";
+  type Entrance = "rise" | "left" | "right" | "top";
 
   let view = $state<SessionView | null>(null);
   /** Couldn't open the folder at all. */
@@ -27,6 +29,13 @@
   let reviewBusy = $state(false);
   let reviewError = $state<string | null>(null);
 
+  let destinations = $state<DestinationItem[]>([]);
+  let shelfOpen = $state(false);
+  /** The highlighted bin; `destinations.length` is the add bin. */
+  let selectedBin = $state(0);
+  // The row ends with an add bin whenever there's room for another folder.
+  const binCount = $derived(destinations.length + (destinations.length < session.MAX_DESTINATIONS ? 1 : 0));
+
   // How the outgoing card leaves and the incoming one arrives. Set just
   // before `view` changes; Svelte reads them when the transitions start.
   let exit = $state<Exit>("fade");
@@ -38,7 +47,7 @@
   async function load() {
     loadError = null;
     try {
-      view = await session.openQueue();
+      [view, destinations] = await Promise.all([session.openQueue(), session.listDestinations()]);
     } catch (e) {
       loadError = String(e);
     }
@@ -64,11 +73,14 @@
   }
 
   const exitFor = (kind: DecisionKind): Exit =>
-    kind === "keep" ? "right" : kind === "stage" ? "left" : "fade";
+    kind === "keep" ? "right" : kind === "stage" ? "left" : kind === "file" ? "up" : "fade";
+
+  const returnFor = (kind: DecisionKind): Entrance =>
+    kind === "keep" ? "right" : kind === "stage" ? "left" : kind === "file" ? "top" : "rise";
 
   /** Returns false when there's no card to decide on, ending a hold. */
   function makeDecision(kind: DecisionKind): boolean {
-    if (!view?.current || review) return false;
+    if (!view?.current || review || shelfOpen) return false;
     notice = null;
     status = null;
     enqueue(async () => {
@@ -88,7 +100,7 @@
       // The card comes back in from the side it left by, so an undo reads
       // as a rewind rather than as another decision.
       exit = "fade";
-      entrance = change.kind === "keep" ? "right" : change.kind === "stage" ? "left" : "rise";
+      entrance = returnFor(change.kind);
       view = change.view;
     });
   }
@@ -101,6 +113,60 @@
       exit = exitFor(change.kind);
       entrance = "rise";
       view = change.view;
+    });
+  }
+
+  function openShelf() {
+    if (!view?.current || review) return;
+    held.stop();
+    notice = null;
+    selectedBin = Math.min(selectedBin, binCount - 1);
+    shelfOpen = true;
+  }
+
+  function stepBin(step: number) {
+    selectedBin = Math.min(Math.max(selectedBin + step, 0), binCount - 1);
+  }
+
+  function confirmShelf() {
+    if (selectedBin < destinations.length) {
+      fileInto(selectedBin);
+    } else {
+      addFolder();
+    }
+  }
+
+  /** Files the current file into bin `index`. The move happens at once
+   *  and can be undone. */
+  function fileInto(index: number) {
+    const destination = destinations[index];
+    if (!destination || !view?.current || review) return;
+    held.stop();
+    shelfOpen = false;
+    notice = null;
+    status = null;
+    enqueue(async () => {
+      const next = await session.fileCurrent(destination.id);
+      // Up, toward the shelf: the file visibly goes the way you reached.
+      exit = "up";
+      entrance = "rise";
+      view = next;
+    });
+  }
+
+  function addFolder() {
+    held.stop();
+    shelfOpen = false;
+    notice = null;
+    enqueue(async () => {
+      destinations = await session.addDestination();
+    });
+  }
+
+  function removeFolder(id: string) {
+    enqueue(async () => {
+      destinations = await session.removeDestination(id);
+      selectedBin = Math.min(selectedBin, binCount - 1);
     });
   }
 
@@ -153,9 +219,44 @@
     // The review list handles its own keys while it's open.
     if (!view || review) return;
 
+    // While the shelf is open the arrows steer it instead of deciding.
+    if (shelfOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      switch (e.key) {
+        case "ArrowLeft":
+          e.preventDefault();
+          stepBin(-1);
+          break;
+        case "ArrowRight":
+          e.preventDefault();
+          stepBin(1);
+          break;
+        case "Enter":
+          e.preventDefault();
+          if (!e.repeat) confirmShelf();
+          break;
+        case "Escape":
+        case "ArrowUp":
+        case "ArrowDown":
+          e.preventDefault();
+          shelfOpen = false;
+          break;
+        case "Delete":
+        case "Backspace":
+          // Frees a slot for another folder. Only the shelf forgets it:
+          // the folder and anything already filed there stay put.
+          e.preventDefault();
+          if (selectedBin < destinations.length) removeFolder(destinations[selectedBin].id);
+          break;
+      }
+      return;
+    }
+
     if ((e.ctrlKey || e.metaKey) && !e.altKey) {
       const key = e.key.toLowerCase();
-      if (key === "z") {
+      if (key === "n") {
+        e.preventDefault();
+        addFolder();
+      } else if (key === "z") {
         e.preventDefault();
         e.shiftKey ? redo() : undo();
       } else if (key === "y") {
@@ -183,9 +284,18 @@
         e.preventDefault();
         if (!e.repeat) makeDecision("skip");
         break;
+      case "ArrowUp":
+        e.preventDefault();
+        openShelf();
+        break;
       case "Enter":
         e.preventDefault();
         if (!e.repeat) open();
+        break;
+      case "1":
+      case "2":
+      case "3":
+        if (!e.repeat) fileInto(Number(e.key) - 1);
         break;
     }
   }
@@ -196,6 +306,13 @@
   function cardOut(_node: Element, { exit }: { exit: Exit }) {
     if (reduceMotion || exit === "fade") {
       return { duration: 120, css: (t: number) => `opacity: ${t}` };
+    }
+    if (exit === "up") {
+      return {
+        duration: 140,
+        easing: cubicIn,
+        css: (t: number, u: number) => `transform: translateY(${-u * TRAVEL}px); opacity: ${t}`,
+      };
     }
     const dx = exit === "right" ? TRAVEL : -TRAVEL;
     return {
@@ -214,6 +331,13 @@
         duration: 280,
         easing: cubicOut,
         css: (t: number, u: number) => `transform: translateY(${u * 40}px); opacity: ${t}`,
+      };
+    }
+    if (from === "top") {
+      return {
+        duration: 220,
+        easing: cubicOut,
+        css: (t: number, u: number) => `transform: translateY(${-u * TRAVEL}px); opacity: ${t}`,
       };
     }
     const dx = from === "right" ? TRAVEL : -TRAVEL;
@@ -266,7 +390,7 @@
     <section class="stage">
       {#if view.current}
         {#key view.current.id}
-          <div class="slot" in:cardIn|global={{ from: entrance }} out:cardOut|global={{ exit }}>
+          <div class="slot" class:behind-shelf={shelfOpen} in:cardIn|global={{ from: entrance }} out:cardOut|global={{ exit }}>
             <Card item={view.current} onOpen={open} />
           </div>
         {/key}
@@ -281,16 +405,29 @@
           </p>
         </div>
       {/if}
+
+      {#if shelfOpen}
+        <div class="shelf" transition:fly={{ y: reduceMotion ? 0 : -16, duration: 200 }}>
+          <DestinationShelf
+            {destinations}
+            highlighted={selectedBin}
+            onSelect={fileInto}
+            onAdd={addFolder}
+            onRemove={removeFolder}
+            onClose={() => (shelfOpen = false)}
+          />
+        </div>
+      {/if}
     </section>
 
-    <nav class="decisions" aria-label="Decide on this file">
+    <nav class="decisions" class:dimmed={shelfOpen} aria-label="Decide on this file">
       <DecisionButton title="Stage" icon="trash" key="←" consequential
         hint="Stage for trash. You review before anything is deleted.  (←)"
         disabled={!view.current} onclick={() => makeDecision("stage")} />
       <DecisionButton title="Skip" icon="skip" key="␣" hint="Skip. It comes back at the end.  (Space)"
         disabled={!view.current} onclick={() => makeDecision("skip")} />
-      <DecisionButton title="File" icon="folder" key="↑" hint="Filing into folders comes with file actions"
-        disabled onclick={() => {}} />
+      <DecisionButton title="File" icon="folder" key="↑" hint="File into a folder. It moves right away, and Undo moves it back.  (↑)"
+        disabled={!view.current} onclick={openShelf} />
       <DecisionButton title="Keep" icon="check" key="→" disabled={!view.current} onclick={() => makeDecision("keep")} />
     </nav>
 
@@ -402,6 +539,7 @@
   /* Outgoing and incoming cards share one grid cell so they overlap
      while they animate. */
   .stage {
+    position: relative;
     display: grid;
     flex: 1;
     align-items: center;
@@ -411,6 +549,27 @@
   .slot {
     grid-area: 1 / 1;
     min-width: 0;
+    transition: scale 0.2s ease-out, opacity 0.2s ease-out;
+  }
+
+  /* The card steps back while the shelf is open, so the bins are clearly
+     what the keys now act on. */
+  .behind-shelf {
+    scale: 0.85;
+  }
+
+  .behind-shelf,
+  .dimmed {
+    opacity: 0.35;
+    pointer-events: none;
+  }
+
+  .shelf {
+    position: absolute;
+    top: 0;
+    right: 0;
+    left: 0;
+    z-index: 1;
   }
 
   .done {
@@ -438,6 +597,7 @@
   .decisions {
     display: flex;
     gap: var(--space-small);
+    transition: opacity 0.2s ease-out;
   }
 
   footer p {
