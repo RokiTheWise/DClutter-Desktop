@@ -8,8 +8,12 @@
 //! when fingers touch or lift. macOS swipe handling depends on exactly
 //! that (a fresh gesture per touch, ignoring momentum once fingers lift,
 //! "let go" to file on the shelf), so DClutter reads the precision
-//! touchpad's own reports through Windows Raw Input and passes the finger
-//! count on.
+//! touchpad's own reports through Windows Raw Input and passes on how many
+//! fingers are down and where. Positions matter too: once a two-finger
+//! scroll starts vertically, Windows holds it on that axis, so sliding
+//! sideways across the shelf never shows up as scrolling.
+
+use serde::Serialize;
 
 #[cfg(windows)]
 pub use windows_impl::watch;
@@ -23,27 +27,53 @@ mod usage {
     pub const TIP_SWITCH: u16 = 0x42;
     pub const CONTACT_ID: u16 = 0x51;
     pub const CONTACT_COUNT: u16 = 0x54;
+    pub const GENERIC_DESKTOP_PAGE: u16 = 0x01;
+    pub const X: u16 = 0x30;
+    pub const Y: u16 = 0x31;
 }
 
-/// Turns a touchpad's reports into "fingers down" counts.
+/// One contact slot in a report. `x` and `y` are 0 to 1 across the
+/// touchpad, from its top-left corner.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Contact {
+    pub id: u32,
+    pub touching: bool,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// What's on the touchpad after a frame: how many fingers, and the middle
+/// of them (0 to 1 across the touchpad from its top-left corner), if any.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Touch {
+    pub fingers: usize,
+    pub x: Option<f32>,
+    pub y: Option<f32>,
+}
+
+/// Movement smaller than this, as a fraction of the touchpad, isn't worth
+/// sending on.
+const MIN_MOVE: f32 = 0.002;
+
+/// Turns a touchpad's reports into what's touching it.
 ///
 /// A precision touchpad describes each frame as a contact count plus one
-/// entry per contact (its id and whether it's touching). A frame can fit
+/// entry per contact (its id, whether it's touching, and where). A frame can fit
 /// in one report ("parallel" mode) or be spread over several ("hybrid"
 /// mode), where only the first report carries the count and the rest say
 /// zero. Entries past the frame's count are unused slots.
 #[derive(Debug, Default)]
 pub struct FrameAssembler {
     remaining: usize,
-    touching: Vec<u32>,
-    fingers: usize,
+    touching: Vec<Contact>,
+    last: Option<Touch>,
 }
 
 impl FrameAssembler {
     /// Feeds one report: its contact count, as the touchpad sent it, and
-    /// each contact slot's (id, touching). Returns the new number of
-    /// fingers down when a frame completes with a different count.
-    pub fn report(&mut self, count: u32, slots: &[(u32, bool)]) -> Option<usize> {
+    /// its contact slots. When a frame completes and the number of fingers
+    /// changed, or they moved, returns what's on the touchpad now.
+    pub fn report(&mut self, count: u32, slots: &[Contact]) -> Option<Touch> {
         if count > 0 {
             // A new frame.
             self.remaining = count as usize;
@@ -53,9 +83,9 @@ impl FrameAssembler {
             return None;
         }
         let used = self.remaining.min(slots.len());
-        for &(id, touching) in &slots[..used] {
-            if touching && !self.touching.contains(&id) {
-                self.touching.push(id);
+        for contact in &slots[..used] {
+            if contact.touching && !self.touching.iter().any(|c| c.id == contact.id) {
+                self.touching.push(*contact);
             }
         }
         self.remaining -= used;
@@ -63,10 +93,31 @@ impl FrameAssembler {
             return None;
         }
         let fingers = self.touching.len();
-        (fingers != self.fingers).then(|| {
-            self.fingers = fingers;
-            fingers
-        })
+        let (x, y) = if fingers == 0 {
+            (None, None)
+        } else {
+            let n = fingers as f32;
+            let x = self.touching.iter().map(|c| c.x).sum::<f32>() / n;
+            let y = self.touching.iter().map(|c| c.y).sum::<f32>() / n;
+            (Some(x), Some(y))
+        };
+        let touch = Touch { fingers, x, y };
+        let changed = match self.last {
+            None => true,
+            Some(last) if last.fingers != fingers => true,
+            Some(last) => {
+                let moved = |a: Option<f32>, b: Option<f32>| match (a, b) {
+                    (Some(a), Some(b)) => (a - b).abs() >= MIN_MOVE,
+                    _ => false,
+                };
+                moved(last.x, x) || moved(last.y, y)
+            }
+        };
+        if !changed {
+            return None;
+        }
+        self.last = Some(touch);
+        Some(touch)
     }
 }
 
@@ -88,9 +139,9 @@ mod windows_impl {
     use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, WM_INPUT};
 
-    use super::{FrameAssembler, usage};
+    use super::{Contact, FrameAssembler, Touch, usage};
 
-    type Callback = Box<dyn Fn(usize) + Send + Sync>;
+    type Callback = Box<dyn Fn(Touch) + Send + Sync>;
 
     /// What one touchpad's reports look like, worked out once from its
     /// HID description.
@@ -100,6 +151,9 @@ mod windows_impl {
         count_link: u16,
         /// One link collection per contact slot, in report order.
         contact_links: Vec<u16>,
+        /// The logical range of X and Y, for turning positions into 0 to 1.
+        x_range: (i32, i32),
+        y_range: (i32, i32),
         frames: FrameAssembler,
     }
 
@@ -116,11 +170,11 @@ mod windows_impl {
     static WATCHER: OnceLock<Mutex<Watcher>> = OnceLock::new();
     const SUBCLASS_ID: usize = 0xDC1;
 
-    /// Starts reporting the number of fingers on any precision touchpad to
-    /// `on_change`, from `window`'s thread. Call once, on that thread.
-    /// Touchpads that don't describe their contacts report nothing, and
-    /// the caller should carry on without.
-    pub fn watch(window: isize, on_change: impl Fn(usize) + Send + Sync + 'static) -> Result<(), String> {
+    /// Starts reporting what's on any precision touchpad to `on_change`,
+    /// from `window`'s thread. Call once, on that thread. Touchpads that
+    /// don't describe their contacts report nothing, and the caller should
+    /// carry on without.
+    pub fn watch(window: isize, on_change: impl Fn(Touch) + Send + Sync + 'static) -> Result<(), String> {
         let window = window as HWND;
         let device = RAWINPUTDEVICE {
             usUsagePage: usage::DIGITIZER_PAGE,
@@ -206,8 +260,8 @@ mod windows_impl {
         let Some(device) = entry else { return };
         for mut report in reports {
             let (count, slots) = unsafe { read_report(device, &mut report) };
-            if let Some(fingers) = device.frames.report(count, &slots) {
-                (watcher.on_change)(fingers);
+            if let Some(touch) = device.frames.report(count, &slots) {
+                (watcher.on_change)(touch);
             }
         }
     }
@@ -246,26 +300,50 @@ mod windows_impl {
 
         let mut count_link = None;
         let mut contact_links = Vec::new();
+        let (mut x_range, mut y_range) = (None, None);
         for cap in &caps {
-            if cap.UsagePage != usage::DIGITIZER_PAGE || cap.IsRange {
+            if cap.IsRange {
                 continue;
             }
             // SAFETY: IsRange is false, so NotRange is the live variant.
             let used = unsafe { cap.Anonymous.NotRange.Usage };
-            if used == usage::CONTACT_COUNT {
-                count_link = Some(cap.LinkCollection);
-            } else if used == usage::CONTACT_ID && !contact_links.contains(&cap.LinkCollection) {
-                contact_links.push(cap.LinkCollection);
+            match (cap.UsagePage, used) {
+                (usage::DIGITIZER_PAGE, usage::CONTACT_COUNT) => count_link = Some(cap.LinkCollection),
+                (usage::DIGITIZER_PAGE, usage::CONTACT_ID) if !contact_links.contains(&cap.LinkCollection) => {
+                    contact_links.push(cap.LinkCollection)
+                }
+                (usage::GENERIC_DESKTOP_PAGE, usage::X) if x_range.is_none() => {
+                    x_range = Some((cap.LogicalMin, cap.LogicalMax))
+                }
+                (usage::GENERIC_DESKTOP_PAGE, usage::Y) if y_range.is_none() => {
+                    y_range = Some((cap.LogicalMin, cap.LogicalMax))
+                }
+                _ => {}
             }
         }
         if contact_links.is_empty() {
             return None;
         }
-        Some(Device { preparsed, count_link: count_link?, contact_links, frames: FrameAssembler::default() })
+        Some(Device {
+            preparsed,
+            count_link: count_link?,
+            contact_links,
+            x_range: x_range?,
+            y_range: y_range?,
+            frames: FrameAssembler::default(),
+        })
     }
 
-    /// One report's contact count and its slots' (id, touching).
-    unsafe fn read_report(device: &Device, report: &mut [u8]) -> (u32, Vec<(u32, bool)>) {
+    /// Where `value` sits in `range`, from 0 to 1.
+    fn fraction(value: u32, (min, max): (i32, i32)) -> f32 {
+        if max <= min {
+            return 0.5;
+        }
+        ((value as i64 - min as i64) as f32 / (max - min) as f32).clamp(0.0, 1.0)
+    }
+
+    /// One report's contact count and its contact slots.
+    unsafe fn read_report(device: &Device, report: &mut [u8]) -> (u32, Vec<Contact>) {
         let data = device.preparsed.as_ptr() as isize;
         let len = report.len() as u32;
         let ptr = report.as_mut_ptr();
@@ -285,7 +363,10 @@ mod windows_impl {
                     let ok = HidP_GetUsages(HidP_Input, usage::DIGITIZER_PAGE, link, usages.as_mut_ptr(), &mut used, data, ptr, len)
                         == HIDP_STATUS_SUCCESS;
                     let touching = ok && usages[..used as usize].contains(&usage::TIP_SWITCH);
-                    (id, touching)
+                    let (mut x, mut y) = (0u32, 0u32);
+                    HidP_GetUsageValue(HidP_Input, usage::GENERIC_DESKTOP_PAGE, link, usage::X, &mut x, data, ptr, len);
+                    HidP_GetUsageValue(HidP_Input, usage::GENERIC_DESKTOP_PAGE, link, usage::Y, &mut y, data, ptr, len);
+                    Contact { id, touching, x: fraction(x, device.x_range), y: fraction(y, device.y_range) }
                 })
                 .collect();
             (count, slots)
@@ -295,44 +376,73 @@ mod windows_impl {
 
 #[cfg(test)]
 mod tests {
-    use super::FrameAssembler;
+    use super::{Contact, FrameAssembler, Touch};
+
+    fn at(id: u32, touching: bool, x: f32, y: f32) -> Contact {
+        Contact { id, touching, x, y }
+    }
+
+    fn fingers(touch: Option<Touch>) -> Option<usize> {
+        touch.map(|t| t.fingers)
+    }
 
     #[test]
     fn counts_fingers_in_a_single_report_frame() {
         let mut frames = FrameAssembler::default();
         // Two fingers down; the third slot is unused.
-        assert_eq!(frames.report(2, &[(0, true), (1, true), (0, false)]), Some(2));
-        // Same again: no change to report.
-        assert_eq!(frames.report(2, &[(0, true), (1, true), (0, false)]), None);
+        let slots = [at(0, true, 0.4, 0.5), at(1, true, 0.6, 0.5), at(0, false, 0.0, 0.0)];
+        assert_eq!(fingers(frames.report(2, &slots)), Some(2));
+        // Same again, not moving: nothing to report.
+        assert_eq!(frames.report(2, &slots), None);
+    }
+
+    #[test]
+    fn reports_where_the_fingers_are() {
+        let mut frames = FrameAssembler::default();
+        let touch = frames.report(2, &[at(0, true, 0.2, 0.4), at(1, true, 0.4, 0.6)]).unwrap();
+        assert!((touch.x.unwrap() - 0.3).abs() < 1e-6);
+        assert!((touch.y.unwrap() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reports_movement_but_not_jitter() {
+        let mut frames = FrameAssembler::default();
+        frames.report(2, &[at(0, true, 0.2, 0.5), at(1, true, 0.4, 0.5)]);
+        assert_eq!(frames.report(2, &[at(0, true, 0.2005, 0.5), at(1, true, 0.4005, 0.5)]), None);
+        let moved = frames.report(2, &[at(0, true, 0.25, 0.5), at(1, true, 0.45, 0.5)]).unwrap();
+        assert!((moved.x.unwrap() - 0.35).abs() < 1e-6);
     }
 
     #[test]
     fn assembles_a_frame_spread_over_several_reports() {
         let mut frames = FrameAssembler::default();
         // Hybrid mode: three contacts, one slot per report, count only first.
-        assert_eq!(frames.report(3, &[(4, true)]), None);
-        assert_eq!(frames.report(0, &[(5, true)]), None);
-        assert_eq!(frames.report(0, &[(6, true)]), Some(3));
+        assert_eq!(frames.report(3, &[at(4, true, 0.1, 0.1)]), None);
+        assert_eq!(frames.report(0, &[at(5, true, 0.2, 0.1)]), None);
+        assert_eq!(fingers(frames.report(0, &[at(6, true, 0.3, 0.1)])), Some(3));
     }
 
     #[test]
     fn reports_the_lift_when_every_contact_lets_go() {
         let mut frames = FrameAssembler::default();
-        frames.report(2, &[(0, true), (1, true)]);
-        assert_eq!(frames.report(2, &[(0, true), (1, false)]), Some(1));
-        assert_eq!(frames.report(1, &[(0, false), (9, false)]), Some(0));
+        frames.report(2, &[at(0, true, 0.4, 0.5), at(1, true, 0.6, 0.5)]);
+        assert_eq!(fingers(frames.report(2, &[at(0, true, 0.4, 0.5), at(1, false, 0.6, 0.5)])), Some(1));
+        let lifted = frames.report(1, &[at(0, false, 0.4, 0.5), at(9, false, 0.0, 0.0)]).unwrap();
+        assert_eq!(lifted, Touch { fingers: 0, x: None, y: None });
     }
 
     #[test]
     fn ignores_unused_slots_past_the_count() {
         let mut frames = FrameAssembler::default();
         // Slot 2 holds stale data from an earlier frame.
-        assert_eq!(frames.report(1, &[(3, true), (7, true)]), Some(1));
+        let touch = frames.report(1, &[at(3, true, 0.5, 0.5), at(7, true, 0.9, 0.9)]).unwrap();
+        assert_eq!(touch.fingers, 1);
+        assert_eq!(touch.x, Some(0.5));
     }
 
     #[test]
     fn ignores_stray_reports_outside_a_frame() {
         let mut frames = FrameAssembler::default();
-        assert_eq!(frames.report(0, &[(1, true)]), None);
+        assert_eq!(frames.report(0, &[at(1, true, 0.5, 0.5)]), None);
     }
 }

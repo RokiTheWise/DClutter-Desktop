@@ -626,9 +626,10 @@ fn open_current(app: AppHandle, state: State<'_, AppState>) -> Result<(), String
         .map_err(|e| e.to_string())
 }
 
-/// Tells the interface how many fingers are on the touchpad, as
+/// Tells the interface how many fingers are on the touchpad and where, as
 /// `touchpad` events, so swipes can start fresh on each touch and end on
-/// lift. The WebView can't see either. Without it, swipes still work,
+/// lift, and the shelf can follow fingers sliding sideways. The WebView
+/// can't see any of that. Without it, swipes still work,
 /// ending after a quiet moment instead.
 fn watch_touchpad(window: &WebviewWindow) {
     #[cfg(windows)]
@@ -638,11 +639,11 @@ fn watch_touchpad(window: &WebviewWindow) {
         // Set DCLUTTER_DEBUG_TOUCHPAD to log what the touchpad reports, for
         // checking a touchpad that doesn't behave.
         let debug = std::env::var_os("DCLUTTER_DEBUG_TOUCHPAD").is_some();
-        let watched = dclutter_platform::touchpad::watch(hwnd.0 as isize, move |fingers| {
+        let watched = dclutter_platform::touchpad::watch(hwnd.0 as isize, move |touch| {
             if debug {
-                eprintln!("touchpad: {fingers} finger(s)");
+                eprintln!("touchpad: {} finger(s) at {:?}, {:?}", touch.fingers, touch.x, touch.y);
             }
-            let _ = app.emit("touchpad", fingers);
+            let _ = app.emit("touchpad", touch);
         });
         if let Err(e) = watched {
             eprintln!("Couldn't watch the touchpad: {e}");
