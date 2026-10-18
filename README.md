@@ -11,7 +11,7 @@
 [![Downloads](https://img.shields.io/github/downloads/RokiTheWise/DClutter-Windows/total.svg?style=flat-square&logo=github&logoColor=white&labelColor=24292e&color=blue)](https://github.com/RokiTheWise/DClutter-Windows/releases)
 [![Platform](https://img.shields.io/badge/Windows-10%20%7C%2011-lightgrey.svg?style=flat-square&logo=windows&logoColor=white&labelColor=24292e)](#install)
 
-**[⬇ Download DClutter for Windows 0.1.0](https://github.com/RokiTheWise/DClutter-Windows/releases/download/v0.1.0/DClutter_0.1.0_x64-setup.exe)**
+**[⬇ Download DClutter for Windows 1.0.0](https://github.com/RokiTheWise/DClutter-Windows/releases/download/v1.0.0/DClutter_1.0.0_x64-setup.exe)**
 &nbsp;·&nbsp; [all releases](https://github.com/RokiTheWise/DClutter-Windows/releases)
 
 </div>
@@ -67,12 +67,12 @@ on **Reverse swipe direction** in Settings (`Ctrl+,`).
 
 ## Install
 
-**[⬇ Download the installer](https://github.com/RokiTheWise/DClutter-Windows/releases/download/v0.1.0/DClutter_0.1.0_x64-setup.exe)**
+**[⬇ Download the installer](https://github.com/RokiTheWise/DClutter-Windows/releases/download/v1.0.0/DClutter_1.0.0_x64-setup.exe)**
 for Windows 10 or 11 (64-bit), or the
-[.msi](https://github.com/RokiTheWise/DClutter-Windows/releases/download/v0.1.0/DClutter_0.1.0_x64_en-US.msi)
+[.msi](https://github.com/RokiTheWise/DClutter-Windows/releases/download/v1.0.0/DClutter_1.0.0_x64_en-US.msi)
 if you deploy with Group Policy or another tool that wants one.
 
-1. Run **DClutter_0.1.0_x64-setup.exe**.
+1. Run **DClutter_1.0.0_x64-setup.exe**.
 2. **Windows will probably say "Windows protected your PC". This is expected.**
    Click **More info**, then **Run anyway**.
 3. Follow the installer. DClutter installs for your account only and needs no
