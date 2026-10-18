@@ -14,7 +14,7 @@ use dclutter_platform::{
     Destination, DestinationStore, MAX_DESTINATIONS, RecentFolders, SessionStore, ThumbnailKind,
 };
 use serde::Serialize;
-use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
@@ -626,6 +626,32 @@ fn open_current(app: AppHandle, state: State<'_, AppState>) -> Result<(), String
         .map_err(|e| e.to_string())
 }
 
+/// Tells the interface how many fingers are on the touchpad, as
+/// `touchpad` events, so swipes can start fresh on each touch and end on
+/// lift. The WebView can't see either. Without it, swipes still work,
+/// ending after a quiet moment instead.
+fn watch_touchpad(window: &WebviewWindow) {
+    #[cfg(windows)]
+    {
+        let Ok(hwnd) = window.hwnd() else { return };
+        let app = window.app_handle().clone();
+        // Set DCLUTTER_DEBUG_TOUCHPAD to log what the touchpad reports, for
+        // checking a touchpad that doesn't behave.
+        let debug = std::env::var_os("DCLUTTER_DEBUG_TOUCHPAD").is_some();
+        let watched = dclutter_platform::touchpad::watch(hwnd.0 as isize, move |fingers| {
+            if debug {
+                eprintln!("touchpad: {fingers} finger(s)");
+            }
+            let _ = app.emit("touchpad", fingers);
+        });
+        if let Err(e) = watched {
+            eprintln!("Couldn't watch the touchpad: {e}");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = window;
+}
+
 /// Shrinks the window to fit the screen it opens on, minus the taskbar,
 /// and centres it there. The default 716 × 880 suits the triage card, but
 /// on a laptop at 125–150% scaling it's taller than the usable area, and
@@ -671,6 +697,7 @@ pub fn run() {
                 if let Err(e) = fit_to_work_area(&window) {
                     eprintln!("Couldn't fit the window to the screen: {e}");
                 }
+                watch_touchpad(&window);
                 window.show()?;
             }
             Ok(())
