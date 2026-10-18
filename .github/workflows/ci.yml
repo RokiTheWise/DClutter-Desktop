@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # tauri::generate_context! reads the frontend from build/, so the
+      # app crate only compiles once the interface has been built.
+      - name: Build the interface
+        run: npm run build
+
+      - name: Run the Rust tests
+        run: cargo test --workspace
+
+      - name: Check the interface
+        run: npm run check
