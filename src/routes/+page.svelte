@@ -1,5 +1,6 @@
 <script lang="ts">
   import { convertFileSrc } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { cubicIn, cubicOut } from "svelte/easing";
   import { fly } from "svelte/transition";
   import Card from "$lib/components/Card.svelte";
@@ -156,6 +157,15 @@
   // Touchpad swipes and dragging the card.
 
   const tracker = new SwipeTracker(() => swipeReversed, () => shelfOpen);
+
+  // The app reads finger contacts from the touchpad itself, so a gesture
+  // starts on touch and ends on lift instead of after a quiet moment.
+  $effect(() => {
+    const stop = listen<number>("touchpad", (e) => act(tracker.fingers(e.payload)));
+    return () => {
+      stop.then((unlisten) => unlisten());
+    };
+  });
   let quietTimer: ReturnType<typeof setTimeout> | undefined;
 
   /** Something else has the input: a dialog, a menu, a text field. */
@@ -193,6 +203,10 @@
         case "left":
         case "right":
           if (shelfOpen) stepBin(intent.type === "right" ? 1 : -1);
+          break;
+        case "release":
+          // Let go on the shelf: file into the highlighted bin.
+          if (shelfOpen) confirmShelf();
           break;
       }
     }

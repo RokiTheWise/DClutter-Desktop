@@ -53,8 +53,9 @@
   const touchpad: [string, string][] = [
     ["Two fingers right", "Keep"],
     ["Two fingers left", "Stage for trash"],
-    ["Two fingers up", "Open the destination shelf"],
-    ["On the shelf", "Swipe left or right to choose, up to file, down to close"],
+    ["Two fingers up", "Open the shelf, slide across, let go to file"],
+    ["Drag back down", "Close the shelf without filing"],
+    ["Shelf already open", "Swipe left or right to choose, up to file, down to close"],
   ];
 
   const mouse: [string, string][] = [
