@@ -111,7 +111,7 @@ fn numbered_name(name: &Path, attempt: u32) -> PathBuf {
 /// lets a file move to another drive (Windows copies it, then removes the
 /// original only once the copy succeeded). Folders can't cross drives.
 #[cfg(windows)]
-fn move_without_replacing(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn move_without_replacing(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_COPY_ALLOWED, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -127,7 +127,7 @@ fn move_without_replacing(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn move_without_replacing(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn move_without_replacing(from: &Path, to: &Path) -> io::Result<()> {
     if to.symlink_metadata().is_ok() {
         return Err(io::ErrorKind::AlreadyExists.into());
     }
