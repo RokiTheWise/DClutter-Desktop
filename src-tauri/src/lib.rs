@@ -14,7 +14,7 @@ use dclutter_platform::{
     Destination, DestinationStore, MAX_DESTINATIONS, RecentFolders, SessionStore, ThumbnailKind,
 };
 use serde::Serialize;
-use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
@@ -275,9 +275,10 @@ fn folder_menu(app: AppHandle, state: State<'_, AppState>) -> Result<FolderMenu,
 /// Asks the user for a folder to sort with the system picker. `None` if
 /// they cancelled. Opening it is a separate step, `open_queue`.
 #[tauri::command]
-async fn pick_source_folder(app: AppHandle) -> Option<PathBuf> {
+async fn pick_source_folder(app: AppHandle, window: WebviewWindow) -> Option<PathBuf> {
     app.dialog()
         .file()
+        .set_parent(&window)
         .set_title("Choose a folder to sort")
         .blocking_pick_folder()
         .and_then(|p| p.into_path().ok())
@@ -446,7 +447,11 @@ fn list_destinations(state: State<'_, AppState>) -> Vec<DestinationItem> {
 /// a new one, and adds it to the shelf. Returns the new list, unchanged if
 /// the picker was cancelled.
 #[tauri::command]
-async fn add_destination(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<DestinationItem>, String> {
+async fn add_destination(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<Vec<DestinationItem>, String> {
     if state.destinations.lock().unwrap().len() >= MAX_DESTINATIONS {
         return Err(
             "Three folders is the maximum. Highlight one on the shelf and press Delete to free a slot.".into(),
@@ -456,7 +461,15 @@ async fn add_destination(app: AppHandle, state: State<'_, AppState>) -> Result<V
     // The folder you need often doesn't exist yet; you realise it the
     // moment a file demands one. The Windows picker's New folder button
     // covers that without sending anyone to Explorer.
-    let picked = app.dialog().file().set_title("Choose a folder to file into").blocking_pick_folder();
+    // Owned by the window, so it always opens in front of it (a touchpad
+    // gesture doesn't bring the app forward the way a click does) and the
+    // app waits for it.
+    let picked = app
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("Choose a folder to file into")
+        .blocking_pick_folder();
     let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
         return Ok(list_destinations(state));
     };
@@ -626,6 +639,33 @@ fn open_current(app: AppHandle, state: State<'_, AppState>) -> Result<(), String
         .map_err(|e| e.to_string())
 }
 
+/// Tells the interface how many fingers are on the touchpad and where, as
+/// `touchpad` events, so swipes can start fresh on each touch and end on
+/// lift, and the shelf can follow fingers sliding sideways. The WebView
+/// can't see any of that. Without it, swipes still work,
+/// ending after a quiet moment instead.
+fn watch_touchpad(window: &WebviewWindow) {
+    #[cfg(windows)]
+    {
+        let Ok(hwnd) = window.hwnd() else { return };
+        let app = window.app_handle().clone();
+        // Set DCLUTTER_DEBUG_TOUCHPAD to log what the touchpad reports, for
+        // checking a touchpad that doesn't behave.
+        let debug = std::env::var_os("DCLUTTER_DEBUG_TOUCHPAD").is_some();
+        let watched = dclutter_platform::touchpad::watch(hwnd.0 as isize, move |touch| {
+            if debug {
+                eprintln!("touchpad: {} finger(s) at {:?}, {:?}", touch.fingers, touch.x, touch.y);
+            }
+            let _ = app.emit("touchpad", touch);
+        });
+        if let Err(e) = watched {
+            eprintln!("Couldn't watch the touchpad: {e}");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = window;
+}
+
 /// Shrinks the window to fit the screen it opens on, minus the taskbar,
 /// and centres it there. The default 716 × 880 suits the triage card, but
 /// on a laptop at 125–150% scaling it's taller than the usable area, and
@@ -671,6 +711,7 @@ pub fn run() {
                 if let Err(e) = fit_to_work_area(&window) {
                     eprintln!("Couldn't fit the window to the screen: {e}");
                 }
+                watch_touchpad(&window);
                 window.show()?;
             }
             Ok(())

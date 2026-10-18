@@ -10,10 +10,12 @@
   let {
     section = $bindable(),
     holdSpeed = $bindable(),
+    swipeReversed = $bindable(),
     onClose,
   }: {
     section: SettingsSection;
     holdSpeed: number;
+    swipeReversed: boolean;
     onClose: () => void;
   } = $props();
 
@@ -48,7 +50,16 @@
     ["?", "Show this list"],
   ];
 
+  const touchpad: [string, string][] = [
+    ["Two fingers right", "Keep"],
+    ["Two fingers left", "Stage for trash"],
+    ["Two fingers up", "Open the shelf, slide across, let go to file"],
+    ["Drag back down", "Close the shelf without filing"],
+    ["Shelf already open", "Swipe left or right to choose, up to file, down to close"],
+  ];
+
   const mouse: [string, string][] = [
+    ["Drag the card", "Right to keep, left to stage; works with a finger too"],
     ["Click Stage, Skip, Keep", "Decide on the current file"],
     ["Click File", "Open the destination shelf"],
     ["Click a folder", "File into that folder"],
@@ -107,12 +118,30 @@
           ? "One file every two seconds while holding ← or →. Single presses respond immediately."
           : "Hold ← or → to move through files at this pace. Single presses respond immediately."}
       </p>
+
+      <hr />
+
+      <label class="toggle">
+        <input type="checkbox" bind:checked={swipeReversed} />
+        Reverse swipe direction
+      </label>
+      <p class="help">
+        Turn this on if swiping right stages instead of keeps. That happens when Windows is set to
+        reverse touchpad scrolling.
+      </p>
     </section>
   {:else}
     <section class="controls">
       <h3>Keyboard</h3>
       <dl>
         {#each keyboard as [key, action]}
+          <dt>{key}</dt>
+          <dd>{action}</dd>
+        {/each}
+      </dl>
+      <h3>Touchpad</h3>
+      <dl>
+        {#each touchpad as [key, action]}
           <dt>{key}</dt>
           <dd>{action}</dd>
         {/each}
@@ -216,6 +245,24 @@
     margin: var(--space-medium) 0 0;
     color: var(--text-secondary);
     font-size: 12px;
+  }
+
+  hr {
+    margin: var(--space-large) 0;
+    border: 0;
+    border-top: 1px solid var(--hairline);
+  }
+
+  .toggle {
+    display: flex;
+    align-items: center;
+    gap: var(--space-small);
+    cursor: pointer;
+  }
+
+  .toggle input {
+    margin: 0;
+    accent-color: var(--text-primary);
   }
 
   .controls {

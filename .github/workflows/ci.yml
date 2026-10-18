@@ -30,3 +30,6 @@ jobs:
 
       - name: Check the interface
         run: npm run check
+
+      - name: Run the interface tests
+        run: npm test

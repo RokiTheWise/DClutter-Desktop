@@ -1,5 +1,6 @@
 <script lang="ts">
   import { convertFileSrc } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { cubicIn, cubicOut } from "svelte/easing";
   import { fly } from "svelte/transition";
   import Card from "$lib/components/Card.svelte";
@@ -14,7 +15,8 @@
   import ReviewTrash from "$lib/components/ReviewTrash.svelte";
   import SettingsPanel, { type SettingsSection } from "$lib/components/SettingsPanel.svelte";
   import { HeldDecision } from "$lib/held";
-  import { loadHoldSpeed, saveHoldSpeed } from "$lib/settings";
+  import { loadHoldSpeed, loadSwipeReversed, saveHoldSpeed, saveSwipeReversed } from "$lib/settings";
+  import { SWIPE, SwipeTracker, isMouseWheel, type Intent, type TouchInput } from "$lib/swipe";
   import * as session from "$lib/session";
   import type { DecisionKind, DestinationItem, SessionView, StagedItem } from "$lib/session";
 
@@ -59,6 +61,18 @@
   const held = new HeldDecision();
   let holdSpeed = $state(loadHoldSpeed());
   $effect(() => saveHoldSpeed(holdSpeed));
+  let swipeReversed = $state(loadSwipeReversed());
+  $effect(() => saveSwipeReversed(swipeReversed));
+
+  // Where the card sits while a swipe or drag carries it: -1 to 1 of a full
+  // swipe. `settling` animates it back to rest when a gesture stops short.
+  let swipe = $state(0);
+  let settling = $state(false);
+  /** Where the outgoing card was when its decision was made, so it leaves
+   *  from there instead of jumping back to the middle first. */
+  let exitFrom = $state(0);
+  /** Pixels the card travels at a full swipe. */
+  const SWIPE_TRAVEL = 200;
 
   let settingsOpen = $state(false);
   let settingsSection = $state<SettingsSection>("general");
@@ -121,17 +135,139 @@
             : "rise";
 
   /** Returns false when there's no card to decide on, ending a hold. */
-  function makeDecision(kind: DecisionKind): boolean {
+  /** Returns false when there's no card to decide on, ending a hold.
+   *  `fromSwipe` keeps the card where the gesture left it as it goes. */
+  function makeDecision(kind: DecisionKind, fromSwipe = false): boolean {
     if (!view?.current || review || shelfOpen || renaming) return false;
     notice = null;
     status = null;
+    const from = fromSwipe ? swipe : 0;
     enqueue(async () => {
       const next = await session.decide(kind);
       exit = exitFor(kind);
+      exitFrom = from;
       entrance = "rise";
+      settling = false;
+      swipe = 0;
       view = next;
     });
     return true;
+  }
+
+  // Touchpad swipes and dragging the card.
+
+  const tracker = new SwipeTracker(() => swipeReversed, () => shelfOpen);
+
+  // The app reads finger contacts from the touchpad itself, so a gesture
+  // starts on touch and ends on lift instead of after a quiet moment.
+  $effect(() => {
+    const stop = listen<TouchInput>("touchpad", (e) => act(tracker.touch(e.payload)));
+    return () => {
+      stop.then((unlisten) => unlisten());
+    };
+  });
+  let quietTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Something else has the input: a dialog, a menu, a text field. */
+  const gesturesBlocked = () => !view || !!review || renaming || !!popup || settingsOpen || !!confirm;
+
+  function settleBack() {
+    if (swipe === 0) return;
+    settling = true;
+    swipe = 0;
+  }
+
+  function act(intents: Intent[]) {
+    for (const intent of intents) {
+      switch (intent.type) {
+        case "progress":
+          if (view?.current && !shelfOpen) {
+            settling = false;
+            swipe = intent.value;
+          }
+          break;
+        case "keep":
+        case "stage":
+          if (!makeDecision(intent.type, true)) settleBack();
+          break;
+        case "cancel":
+          settleBack();
+          break;
+        case "up":
+          if (shelfOpen) confirmShelf();
+          else openShelf();
+          break;
+        case "down":
+          if (shelfOpen) shelfOpen = false;
+          break;
+        case "left":
+        case "right":
+          if (shelfOpen) stepBin(intent.type === "right" ? 1 : -1);
+          break;
+        case "release":
+          // Let go on the shelf: file into the highlighted bin.
+          if (shelfOpen) confirmShelf();
+          break;
+      }
+    }
+  }
+
+  function onwheel(e: WheelEvent) {
+    // Mouse wheels, line-based scrolling and pinch-to-zoom aren't swipes.
+    if (e.deltaMode !== 0 || e.ctrlKey || isMouseWheel(e as WheelEvent & { wheelDeltaX?: number; wheelDeltaY?: number })) return;
+    if (gesturesBlocked()) {
+      act(tracker.reset());
+      return;
+    }
+    held.stop();
+    act(tracker.wheel({ dx: e.deltaX, dy: e.deltaY, t: performance.now() }));
+    // Windows never says the fingers lifted; a quiet moment ends a gesture.
+    clearTimeout(quietTimer);
+    quietTimer = setTimeout(() => act(tracker.tick(performance.now())), SWIPE.quietMs + 20);
+  }
+
+  /** A mouse or finger press on the card, until it's clear it's a drag. */
+  let drag: { id: number; x: number; active: boolean } | null = null;
+
+  function onCardPointerDown(e: PointerEvent) {
+    if (e.button !== 0 || gesturesBlocked() || shelfOpen) return;
+    if ((e.target as HTMLElement).closest("button, input, a")) return;
+    drag = { id: e.pointerId, x: e.clientX, active: false };
+  }
+
+  function onCardPointerMove(e: PointerEvent) {
+    if (!drag || e.pointerId !== drag.id) return;
+    const dx = e.clientX - drag.x;
+    if (!drag.active) {
+      // A few pixels of slack, so a click or double-click stays a click.
+      if (Math.abs(dx) < 6) return;
+      drag.active = true;
+      // Keeps the drag going if the pointer leaves the card. If the browser
+      // won't capture this pointer, the drag still works inside the card.
+      try {
+        (e.currentTarget as Element).setPointerCapture(e.pointerId);
+      } catch {}
+      held.stop();
+    }
+    settling = false;
+    swipe = Math.max(-1, Math.min(1, dx / SWIPE_TRAVEL));
+  }
+
+  function onCardPointerUp(e: PointerEvent) {
+    if (!drag || e.pointerId !== drag.id) return;
+    const dragged = drag.active;
+    drag = null;
+    if (!dragged) return;
+    if (Math.abs(swipe) >= SWIPE.commitAt) {
+      if (!makeDecision(swipe > 0 ? "keep" : "stage", true)) settleBack();
+    } else {
+      settleBack();
+    }
+  }
+
+  function onCardPointerCancel() {
+    drag = null;
+    settleBack();
   }
 
   function undo() {
@@ -566,7 +702,7 @@
   const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const TRAVEL = 760;
 
-  function cardOut(_node: Element, { exit }: { exit: Exit }) {
+  function cardOut(_node: Element, { exit, from }: { exit: Exit; from: number }) {
     if (reduceMotion || exit === "fade") {
       return { duration: 120, css: (t: number) => `opacity: ${t}` };
     }
@@ -578,10 +714,14 @@
       };
     }
     const dx = exit === "right" ? TRAVEL : -TRAVEL;
+    // Leave from wherever a swipe or drag had carried the card.
+    const start = from * SWIPE_TRAVEL;
+    const tilt = from * 4;
     return {
       duration: 140,
       easing: cubicIn,
-      css: (t: number, u: number) => `transform: translateX(${u * dx}px); opacity: ${t}`,
+      css: (t: number, u: number) =>
+        `transform: translateX(${start + u * (dx - start)}px) rotate(${tilt}deg); opacity: ${t}`,
     };
   }
 
@@ -615,7 +755,15 @@
   }
 </script>
 
-<svelte:window {onkeydown} onkeyup={(e) => held.stop(e.key)} onblur={() => held.stop()} />
+<svelte:window
+  {onkeydown}
+  {onwheel}
+  onkeyup={(e) => held.stop(e.key)}
+  onblur={() => {
+    held.stop();
+    act(tracker.reset());
+  }}
+/>
 
 {#if loadError}
   <div class="centered">
@@ -673,14 +821,33 @@
 
       <IconButton title="More" icon="more" onclick={openMoreMenu} />
       {#if settingsOpen}
-        <SettingsPanel bind:section={settingsSection} bind:holdSpeed onClose={() => (settingsOpen = false)} />
+        <SettingsPanel
+          bind:section={settingsSection}
+          bind:holdSpeed
+          bind:swipeReversed
+          onClose={() => (settingsOpen = false)}
+        />
       {/if}
     </header>
 
     <section class="stage">
       {#if view.current}
         {#key view.current.id}
-          <div class="slot" class:behind-shelf={shelfOpen} in:cardIn|global={{ from: entrance }} out:cardOut|global={{ exit }}>
+          <div
+            class="slot"
+            role="group"
+            aria-label={view.current.name}
+            class:behind-shelf={shelfOpen}
+            class:settling
+            style:transform={swipe ? `translateX(${swipe * SWIPE_TRAVEL}px) rotate(${swipe * 4}deg)` : null}
+            style:opacity={swipe ? 1 - Math.min(Math.abs(swipe) * 0.35, 0.35) : null}
+            onpointerdown={onCardPointerDown}
+            onpointermove={onCardPointerMove}
+            onpointerup={onCardPointerUp}
+            onpointercancel={onCardPointerCancel}
+            in:cardIn|global={{ from: entrance }}
+            out:cardOut|global={{ exit, from: exitFrom }}
+          >
             <Card item={view.current} onOpen={open} onMenu={(x, y) => (popup = { kind: "card", x, y })} />
           </div>
         {/key}
@@ -887,6 +1054,14 @@
     grid-area: 1 / 1;
     min-width: 0;
     transition: scale 0.2s ease-out, opacity 0.2s ease-out;
+    /* The card's own drag handling owns touches; the page doesn't scroll. */
+    touch-action: none;
+  }
+
+  /* Back to rest after a swipe or drag that stopped short. While a gesture
+     carries the card it follows exactly, unanimated. */
+  .slot.settling {
+    transition: transform 0.22s cubic-bezier(0.2, 0.9, 0.3, 1.2), opacity 0.22s ease-out, scale 0.2s ease-out;
   }
 
   /* The card steps back while the shelf is open, so the bins are clearly

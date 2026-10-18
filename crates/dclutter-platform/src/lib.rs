@@ -14,6 +14,7 @@ mod renames;
 mod scan;
 mod sessions;
 mod thumbnails;
+pub mod touchpad;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod zone_identifier;
 
