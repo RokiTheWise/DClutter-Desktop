@@ -8,13 +8,14 @@
   import Icon from "$lib/components/Icon.svelte";
   import IconButton from "$lib/components/IconButton.svelte";
   import { IMAGE_EXTENSIONS } from "$lib/components/Preview.svelte";
+  import RenameField from "$lib/components/RenameField.svelte";
   import ReviewTrash from "$lib/components/ReviewTrash.svelte";
   import { HeldDecision } from "$lib/held";
   import * as session from "$lib/session";
   import type { DecisionKind, DestinationItem, SessionView, StagedItem } from "$lib/session";
 
   type Exit = "left" | "right" | "up" | "fade";
-  type Entrance = "rise" | "left" | "right" | "top";
+  type Entrance = "rise" | "left" | "right" | "top" | "fade";
 
   let view = $state<SessionView | null>(null);
   /** Couldn't open the folder at all. */
@@ -28,6 +29,10 @@
   let review = $state<StagedItem[] | null>(null);
   let reviewBusy = $state(false);
   let reviewError = $state<string | null>(null);
+
+  let renaming = $state(false);
+  let renameBusy = $state(false);
+  let renameError = $state<string | null>(null);
 
   let destinations = $state<DestinationItem[]>([]);
   let shelfOpen = $state(false);
@@ -79,12 +84,22 @@
   const exitFor = (kind: DecisionKind): Exit =>
     kind === "keep" ? "right" : kind === "stage" ? "left" : kind === "file" ? "up" : "fade";
 
+  // A rename changes the card's name, not its place: a quick cross-fade.
+
   const returnFor = (kind: DecisionKind): Entrance =>
-    kind === "keep" ? "right" : kind === "stage" ? "left" : kind === "file" ? "top" : "rise";
+    kind === "keep"
+      ? "right"
+      : kind === "stage"
+        ? "left"
+        : kind === "file"
+          ? "top"
+          : kind === "rename"
+            ? "fade"
+            : "rise";
 
   /** Returns false when there's no card to decide on, ending a hold. */
   function makeDecision(kind: DecisionKind): boolean {
-    if (!view?.current || review || shelfOpen) return false;
+    if (!view?.current || review || shelfOpen || renaming) return false;
     notice = null;
     status = null;
     enqueue(async () => {
@@ -120,8 +135,40 @@
     });
   }
 
+  /** The name to start editing from: without the extension, which is
+   *  kept automatically and isn't the user's to delete by accident. */
+  function stemOf(item: { name: string; extension: string; isDirectory: boolean }) {
+    return item.isDirectory || !item.extension ? item.name : item.name.slice(0, -(item.extension.length + 1));
+  }
+
+  function startRename() {
+    if (!view?.current || review || shelfOpen) return;
+    held.stop();
+    notice = null;
+    renameError = null;
+    renaming = true;
+  }
+
+  function submitRename(name: string) {
+    renameBusy = true;
+    enqueue(async () => {
+      try {
+        const next = await session.renameCurrent(name);
+        exit = "fade";
+        entrance = "fade";
+        view = next;
+        renaming = false;
+      } catch (e) {
+        // Keep the field open so the name can be fixed.
+        renameError = String(e);
+      } finally {
+        renameBusy = false;
+      }
+    });
+  }
+
   function openShelf() {
-    if (!view?.current || review) return;
+    if (!view?.current || review || renaming) return;
     held.stop();
     notice = null;
     selectedBin = Math.min(selectedBin, binCount - 1);
@@ -220,8 +267,8 @@
   }
 
   function onkeydown(e: KeyboardEvent) {
-    // The review list handles its own keys while it's open.
-    if (!view || review) return;
+    // The review list and the rename field handle their own keys.
+    if (!view || review || renaming) return;
 
     // While the shelf is open the arrows steer it instead of deciding.
     if (shelfOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
@@ -292,6 +339,12 @@
         e.preventDefault();
         openShelf();
         break;
+      // Down, as on macOS, and F2, the Windows rename key.
+      case "ArrowDown":
+      case "F2":
+        e.preventDefault();
+        startRename();
+        break;
       case "Enter":
         e.preventDefault();
         if (!e.repeat) open();
@@ -336,6 +389,9 @@
         easing: cubicOut,
         css: (t: number, u: number) => `transform: translateY(${u * 40}px); opacity: ${t}`,
       };
+    }
+    if (from === "fade") {
+      return { duration: 120, css: (t: number) => `opacity: ${t}` };
     }
     if (from === "top") {
       return {
@@ -436,6 +492,15 @@
     </nav>
 
     <footer>
+      {#if renaming && view.current}
+        <RenameField
+          initial={stemOf(view.current)}
+          busy={renameBusy}
+          error={renameError}
+          onSubmit={submitRename}
+          onCancel={() => (renaming = false)}
+        />
+      {:else}
       {#if notice}
         <p class="notice">{notice}</p>
       {/if}
@@ -445,6 +510,7 @@
       <p class="counts">
         <span class="strong">{view.remaining}</span> left · {view.sorted} sorted{#if view.trashed > 0}{` · ${view.trashed} trashed`}{/if}
       </p>
+      {/if}
     </footer>
   </main>
 

@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type DecisionKind = "keep" | "stage" | "skip" | "file";
+export type DecisionKind = "keep" | "stage" | "skip" | "file" | "rename";
 
 /** Mirrors `CardItem` in src-tauri/src/lib.rs. Timestamps are Unix seconds. */
 export interface CardItem {
@@ -123,6 +123,16 @@ export interface PreviewImage {
 /** The shell's preview for the current or next card, if it has one. */
 export function thumbnail(id: string): Promise<PreviewImage | null> {
   return invoke("thumbnail", { id });
+}
+
+/** Renames the card's file; the extension is kept if `name` has none. */
+export function renameCurrent(name: string): Promise<SessionView> {
+  return invoke("rename_current", { name });
+}
+
+/** Opens File Explorer with the card's file selected. */
+export function revealCurrent(): Promise<void> {
+  return invoke("reveal_current");
 }
 
 /** Opens the file on the card in its default app. */
