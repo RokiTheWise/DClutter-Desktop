@@ -6,6 +6,8 @@
 
 **Swipe to clean your files.**
 
+[![CI](https://img.shields.io/github/actions/workflow/status/RokiTheWise/DClutter-Windows/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI&labelColor=24292e)](https://github.com/RokiTheWise/DClutter-Windows/actions/workflows/ci.yml)
+
 </div>
 
 The Windows (and later Linux) version of [DClutter](https://github.com/RokiTheWise/DClutter),
