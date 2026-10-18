@@ -13,6 +13,7 @@ use dclutter_core::SessionSnapshot;
 
 /// One file per source folder, not one overall, so one folder's saved
 /// decisions can never be applied to another folder's files.
+#[derive(Clone)]
 pub struct SessionStore {
     dir: PathBuf,
 }
