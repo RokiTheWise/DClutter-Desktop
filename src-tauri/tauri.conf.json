@@ -44,6 +44,11 @@
     ],
     "publisher": "Dexter Jethro Enriquez",
     "copyright": "Copyright 2026 Dexter Jethro Enriquez",
-    "shortDescription": "Swipe to clean your files."
+    "shortDescription": "Swipe to clean your files.",
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico"
+      }
+    }
   }
 }
