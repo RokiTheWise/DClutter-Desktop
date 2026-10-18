@@ -4,7 +4,16 @@
   import Icon from "./Icon.svelte";
   import Preview from "./Preview.svelte";
 
-  let { item, onOpen }: { item: CardItem; onOpen: () => void } = $props();
+  let {
+    item,
+    onOpen,
+    onMenu,
+  }: {
+    item: CardItem;
+    onOpen: () => void;
+    /** Right-click, at these window coordinates. */
+    onMenu?: (x: number, y: number) => void;
+  } = $props();
 
   // Grey, informational, at most three — per the design spec. The macOS
   // app's "never opened" chip is left out: Windows can't tell us.
@@ -25,7 +34,15 @@
   ]);
 </script>
 
-<article class="card" ondblclick={onOpen} title="Double-click to open this file">
+<article
+  class="card"
+  ondblclick={onOpen}
+  oncontextmenu={(e) => {
+    e.preventDefault();
+    onMenu?.(e.clientX, e.clientY);
+  }}
+  title="Double-click to open this file, or right-click for more"
+>
   <div class="preview">
     <Preview {item} />
   </div>

@@ -3,6 +3,7 @@
   import { cubicIn, cubicOut } from "svelte/easing";
   import { fly } from "svelte/transition";
   import Card from "$lib/components/Card.svelte";
+  import CardMenu from "$lib/components/CardMenu.svelte";
   import DecisionButton from "$lib/components/DecisionButton.svelte";
   import DestinationShelf from "$lib/components/DestinationShelf.svelte";
   import Icon from "$lib/components/Icon.svelte";
@@ -29,6 +30,9 @@
   let review = $state<StagedItem[] | null>(null);
   let reviewBusy = $state(false);
   let reviewError = $state<string | null>(null);
+
+  /** Where the card's right-click menu is open, if it is. */
+  let menu = $state<{ x: number; y: number } | null>(null);
 
   let renaming = $state(false);
   let renameBusy = $state(false);
@@ -259,6 +263,24 @@
     });
   }
 
+  function reveal() {
+    session.revealCurrent().catch((e) => {
+      notice = `Couldn't show this file in File Explorer: ${e}`;
+    });
+  }
+
+  async function copyName() {
+    const name = view?.current?.name;
+    if (!name) return;
+    try {
+      await navigator.clipboard.writeText(name);
+      notice = null;
+      status = "Copied the file name.";
+    } catch (e) {
+      notice = `Couldn't copy the name: ${e}`;
+    }
+  }
+
   function open() {
     if (!view?.current) return;
     session.openCurrent().catch((e) => {
@@ -267,8 +289,8 @@
   }
 
   function onkeydown(e: KeyboardEvent) {
-    // The review list and the rename field handle their own keys.
-    if (!view || review || renaming) return;
+    // The review list, the rename field and the menu handle their own keys.
+    if (!view || review || renaming || menu) return;
 
     // While the shelf is open the arrows steer it instead of deciding.
     if (shelfOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
@@ -451,7 +473,7 @@
       {#if view.current}
         {#key view.current.id}
           <div class="slot" class:behind-shelf={shelfOpen} in:cardIn|global={{ from: entrance }} out:cardOut|global={{ exit }}>
-            <Card item={view.current} onOpen={open} />
+            <Card item={view.current} onOpen={open} onMenu={(x, y) => (menu = { x, y })} />
           </div>
         {/key}
       {:else}
@@ -513,6 +535,18 @@
       {/if}
     </footer>
   </main>
+
+  {#if menu && view.current}
+    <CardMenu
+      x={menu.x}
+      y={menu.y}
+      onOpen={open}
+      onReveal={reveal}
+      onRename={startRename}
+      onCopyName={copyName}
+      onClose={() => (menu = null)}
+    />
+  {/if}
 
   {#if review}
     <ReviewTrash
