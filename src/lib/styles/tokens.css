@@ -68,6 +68,10 @@ html,
 body {
   margin: 0;
   height: 100%;
+  /* The app window never scrolls; anything long scrolls inside its own
+     panel. Without this, a card animating off the right edge widened the
+     page for a moment and flashed a horizontal scrollbar. */
+  overflow: hidden;
   background: var(--surface);
   color: var(--text-primary);
   font-family: var(--font-ui);
