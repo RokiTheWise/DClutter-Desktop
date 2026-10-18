@@ -132,3 +132,90 @@ describe("telling a mouse wheel from a touchpad", () => {
     expect(isMouseWheel({ deltaX: 0, deltaY: 7, wheelDeltaX: 0, wheelDeltaY: -8 })).toBe(false);
   });
 });
+
+describe("with a touchpad that reports finger contacts", () => {
+  /** Like setup, but the fingers touch before and lift after each swipe. */
+  function contacts({ shelf = false } = {}) {
+    const base = setup({ shelf });
+    const { tracker, state } = base;
+    const touch = () => tracker.fingers(2);
+    const lift = () => tracker.fingers(0);
+    // The shelf opens when the page acts on "up".
+    const follow = (intents: Intent[]) => {
+      for (const i of intents) {
+        if (i.type === "up") state.shelf = true;
+        if (i.type === "down" || i.type === "release") state.shelf = false;
+      }
+      return intents;
+    };
+    return { ...base, touch, lift, follow };
+  }
+
+  it("lets swipes follow each other straight away, without a pause", () => {
+    const { swipe, touch, lift } = contacts();
+    touch();
+    expect(types(swipe(FINGERS_RIGHT * SWIPE.full * 0.6, 0))).toContain("keep");
+    lift();
+    touch();
+    expect(types(swipe(-FINGERS_RIGHT * SWIPE.full * 0.6, 0))).toContain("stage");
+  });
+
+  it("ignores everything after the lift, which is momentum", () => {
+    const { swipe, touch, lift } = contacts();
+    touch();
+    swipe(FINGERS_RIGHT * SWIPE.full * 0.2, 0);
+    lift();
+    expect(swipe(FINGERS_RIGHT * SWIPE.full, 0, 30)).toEqual([]);
+  });
+
+  it("springs back the moment the fingers lift, without waiting", () => {
+    const { swipe, touch, lift } = contacts();
+    touch();
+    swipe(FINGERS_RIGHT * SWIPE.full * 0.2, 0);
+    expect(types(lift())).toEqual(["cancel"]);
+  });
+
+  it("doesn't end a slow swipe just because it paused", () => {
+    const { swipe, touch, pause } = contacts();
+    touch();
+    swipe(FINGERS_RIGHT * SWIPE.full * 0.25, 0);
+    expect(pause(1000)).toEqual([]);
+    expect(types(swipe(FINGERS_RIGHT * SWIPE.full * 0.25, 0))).toContain("keep");
+  });
+
+  it("swipes up, across and lets go to file, as on macOS", () => {
+    const { swipe, touch, lift, follow } = contacts();
+    touch();
+    expect(types(follow(swipe(0, FINGERS_UP * SWIPE.step * 1.2)))).toEqual(["up"]);
+    // Two bins across in the same gesture.
+    expect(types(follow(swipe(FINGERS_RIGHT * SWIPE.binStep * 2.2, 0)))).toEqual(["right", "right"]);
+    // 0.2 of a bin is left over from going right, so going back takes a bit more.
+    expect(types(follow(swipe(-FINGERS_RIGHT * SWIPE.binStep * 1.3, 0)))).toEqual(["left"]);
+    expect(types(follow(lift()))).toEqual(["release"]);
+  });
+
+  it("dragging back down while choosing abandons the shelf", () => {
+    const { swipe, touch, lift, follow } = contacts();
+    touch();
+    follow(swipe(0, FINGERS_UP * SWIPE.step * 1.2));
+    expect(types(follow(swipe(0, -FINGERS_UP * SWIPE.cancelDown * 1.5)))).toEqual(["down"]);
+    expect(lift()).toEqual([]);
+  });
+
+  it("a shelf opened with the keyboard still takes one step per swipe", () => {
+    const { swipe, touch, lift } = contacts({ shelf: true });
+    touch();
+    expect(types(swipe(FINGERS_RIGHT * SWIPE.full, 0))).toEqual(["right"]);
+    expect(lift()).toEqual([]);
+  });
+
+  it("a reset waits for the next touch", () => {
+    const { tracker, swipe, touch, lift } = contacts();
+    touch();
+    tracker.reset();
+    expect(swipe(FINGERS_RIGHT * SWIPE.full, 0)).toEqual([]);
+    lift();
+    touch();
+    expect(types(swipe(FINGERS_RIGHT * SWIPE.full, 0))).toContain("keep");
+  });
+});

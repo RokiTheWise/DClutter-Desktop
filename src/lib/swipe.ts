@@ -2,17 +2,25 @@
  * Turns touchpad scrolling into triage gestures. Port of the macOS app's
  * SwipeMonitorController, adapted to what Windows gives a web view.
  *
- * macOS reports when fingers touch and lift. Windows precision touchpads
- * reach the WebView as plain wheel events, and after the fingers lift the
- * scroll keeps coasting (momentum), so a gesture's end can only be inferred
- * from a quiet moment. Two consequences shape this module:
+ * Swipes reach the WebView as plain wheel events, and after the fingers
+ * lift the scroll keeps coasting (momentum). The app reads the touchpad's
+ * finger contacts natively and passes them in through `fingers`, which
+ * makes this behave like macOS:
  *
- * - A swipe commits as soon as it crosses the threshold, mid-gesture, as on
- *   macOS. Everything after that, including the momentum tail, is ignored
- *   until the touchpad goes quiet, so one swipe can never decide two files.
- * - On the shelf each swipe is one discrete step (left, right, up to file,
- *   down to close) rather than "slide across and let go": without a lift
- *   event, the coasting tail would keep moving the highlight.
+ * - Each touch starts a fresh gesture, so swipes can follow each other
+ *   straight away.
+ * - A sideways swipe commits as soon as it crosses the threshold,
+ *   mid-gesture. The rest of that gesture is ignored, and everything after
+ *   the lift is momentum, also ignored.
+ * - A swipe that stopped short springs back when the fingers lift.
+ * - Swiping up opens the shelf and carries straight on into choosing a bin
+ *   by sliding sideways; lifting files into it, and dragging back down
+ *   cancels.
+ *
+ * Touchpads that don't report contacts fall back to inferring a gesture's
+ * end from a quiet moment. Without a lift event the coasting tail would
+ * keep moving the highlight, so on the shelf each swipe is then a single
+ * step: left, right, up to file, down to close.
  *
  * Pure and clock-free: the caller feeds events and the time, and calls
  * `tick` once things may have gone quiet.
@@ -36,7 +44,9 @@ export type Intent =
   | { type: "up" }
   | { type: "down" }
   | { type: "left" }
-  | { type: "right" };
+  | { type: "right" }
+  /** Fingers lifted while choosing a bin: file into the highlighted one. */
+  | { type: "release" };
 
 export const SWIPE = {
   /** Pixels of travel before deciding whether a gesture is sideways. */
@@ -47,7 +57,11 @@ export const SWIPE = {
   commitAt: 0.4,
   /** Pixels for a discrete swipe: opening the shelf, or a step on it. */
   step: 90,
-  /** A gesture that's been quiet this long has ended. */
+  /** Sideways pixels per bin while sliding across the shelf, as on macOS. */
+  binStep: 60,
+  /** Pixels back down that abandon the shelf while choosing. */
+  cancelDown: 50,
+  /** Without contacts, a gesture that's been quiet this long has ended. */
   quietMs: 150,
 } as const;
 
@@ -56,12 +70,19 @@ type Phase =
   | { kind: "deciding"; x: number; y: number }
   | { kind: "sideways"; x: number }
   | { kind: "vertical"; y: number }
-  /** Finished with this gesture; ignore input until it goes quiet. */
+  /** Opened the shelf this gesture; sliding sideways chooses a bin. */
+  | { kind: "steering"; x: number; y: number }
+  /** Finished with this gesture; ignore the rest of it. */
   | { kind: "spent" };
 
 export class SwipeTracker {
   private phase: Phase = { kind: "idle" };
   private lastEvent = -Infinity;
+  /** Whether the touchpad reports finger contacts at all. */
+  private contacts = false;
+  private touching = false;
+  /** Whether the shelf was already open when this gesture began. */
+  private startedOnShelf = false;
 
   /**
    * @param reversed Users who set Windows to reverse touchpad scrolling
@@ -74,11 +95,33 @@ export class SwipeTracker {
     private onShelf: () => boolean,
   ) {}
 
+  /** The number of fingers on the touchpad changed. */
+  fingers(count: number): Intent[] {
+    this.contacts = true;
+    if (count > 0 && !this.touching) {
+      // A new touch: whatever came before is over.
+      this.touching = true;
+      const intents = this.end();
+      this.phase = { kind: "idle" };
+      return intents;
+    }
+    if (count === 0 && this.touching) {
+      this.touching = false;
+      return this.lift();
+    }
+    return [];
+  }
+
   /** Feeds one touchpad wheel event. */
   wheel({ dx, dy, t }: WheelInput): Intent[] {
     const intents: Intent[] = [];
-    // A gap means the previous gesture ended, whatever state it was in.
-    if (t - this.lastEvent > SWIPE.quietMs) intents.push(...this.end());
+    if (this.contacts) {
+      // After the lift it's only momentum.
+      if (!this.touching) return [];
+    } else if (t - this.lastEvent > SWIPE.quietMs) {
+      // A gap means the previous gesture ended, whatever state it was in.
+      intents.push(...this.end());
+    }
     this.lastEvent = t;
 
     // Windows' default "down motion scrolls up" is natural scrolling:
@@ -94,6 +137,7 @@ export class SwipeTracker {
         return intents;
       case "idle":
       case "deciding": {
+        if (phase.kind === "idle") this.startedOnShelf = this.onShelf();
         const x = (phase.kind === "deciding" ? phase.x : 0) + right;
         const y = (phase.kind === "deciding" ? phase.y : 0) + up;
         if (Math.hypot(x, y) < SWIPE.axisLock) {
@@ -109,23 +153,32 @@ export class SwipeTracker {
       case "vertical":
         phase.y += up;
         return [...intents, ...this.advance()];
+      case "steering":
+        phase.x += right;
+        phase.y += up;
+        return [...intents, ...this.steer(phase)];
     }
   }
 
-  /** Call when no event has arrived for a while; ends a stopped gesture. */
+  /** Call when no event has arrived for a while; ends a stopped gesture.
+   *  Only needed for touchpads that don't report contacts. */
   tick(t: number): Intent[] {
+    if (this.contacts) return [];
     return t - this.lastEvent > SWIPE.quietMs ? this.end() : [];
   }
 
   /** Abandons any gesture, for when something else takes over input. */
   reset(): Intent[] {
-    return this.end();
+    const intents = this.end();
+    // Wait for a fresh touch before tracking again.
+    if (this.contacts && this.touching) this.phase = { kind: "spent" };
+    return intents;
   }
 
   private advance(): Intent[] {
     const phase = this.phase;
     if (phase.kind === "sideways") {
-      if (this.onShelf()) {
+      if (this.startedOnShelf) {
         if (Math.abs(phase.x) < SWIPE.step) return [];
         this.phase = { kind: "spent" };
         return [{ type: phase.x > 0 ? "right" : "left" }];
@@ -137,16 +190,45 @@ export class SwipeTracker {
     }
     if (phase.kind === "vertical") {
       if (Math.abs(phase.y) < SWIPE.step) return [];
+      // Opening the shelf with a touchpad that reports contacts: the same
+      // gesture carries on into choosing a bin, as on macOS.
+      if (phase.y > 0 && this.contacts && !this.startedOnShelf) {
+        this.phase = { kind: "steering", x: 0, y: 0 };
+        return [{ type: "up" }];
+      }
       this.phase = { kind: "spent" };
       return [{ type: phase.y > 0 ? "up" : "down" }];
     }
     return [];
   }
 
-  private end(): Intent[] {
-    const wasSideways = this.phase.kind === "sideways" && !this.onShelf();
+  private steer(phase: { x: number; y: number }): Intent[] {
+    // Dragging back down abandons the shelf without filing.
+    if (phase.y <= -SWIPE.cancelDown) {
+      this.phase = { kind: "spent" };
+      return [{ type: "down" }];
+    }
+    const steps: Intent[] = [];
+    while (Math.abs(phase.x) >= SWIPE.binStep) {
+      const right = phase.x > 0;
+      phase.x -= right ? SWIPE.binStep : -SWIPE.binStep;
+      steps.push({ type: right ? "right" : "left" });
+    }
+    return steps;
+  }
+
+  private lift(): Intent[] {
+    const phase = this.phase;
     this.phase = { kind: "idle" };
+    if (phase.kind === "steering") return [{ type: "release" }];
     // A sideways swipe that stopped short puts the card back.
+    if (phase.kind === "sideways" && !this.startedOnShelf) return [{ type: "cancel" }];
+    return [];
+  }
+
+  private end(): Intent[] {
+    const wasSideways = this.phase.kind === "sideways" && !this.startedOnShelf;
+    this.phase = { kind: "idle" };
     return wasSideways ? [{ type: "cancel" }] : [];
   }
 }
