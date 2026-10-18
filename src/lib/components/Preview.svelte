@@ -63,6 +63,10 @@
 <style>
   .well {
     display: grid;
+    /* One cell exactly the size of the well. An auto-sized row grows to
+       the image's natural height, so a large picture was cropped instead
+       of scaled down to fit. */
+    grid-template: minmax(0, 1fr) / minmax(0, 1fr);
     place-items: center;
     height: var(--preview-height);
     border: 1px solid var(--hairline);
