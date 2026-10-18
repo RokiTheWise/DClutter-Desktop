@@ -4,12 +4,15 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use dclutter_core::{
     DecisionKind, FileCandidate, QueueContext, QueueScorer, ScoreWeights, Step, TriageSession,
 };
-use dclutter_platform::{Destination, DestinationStore, MAX_DESTINATIONS, SessionStore};
+use base64::Engine;
+use dclutter_platform::{
+    Destination, DestinationStore, MAX_DESTINATIONS, SessionStore, ThumbnailKind,
+};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
@@ -29,6 +32,25 @@ struct AppState {
     destinations: Mutex<Vec<Destination>>,
     store: DestinationStore,
     sessions: SessionStore,
+    /// Recent previews, so going back to a card or undoing doesn't ask the
+    /// shell again. Keyed by file and modification time.
+    thumbnails: Mutex<HashMap<String, Option<Arc<PreviewImage>>>>,
+}
+
+/// How many previews to keep; a few screens' worth either way.
+const THUMBNAIL_CACHE: usize = 32;
+/// Requested size in pixels. The preview well is at most about 760 wide.
+const THUMBNAIL_SIZE: u32 = 768;
+
+/// A shell preview, ready for an <img>.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewImage {
+    /// "thumbnail" for a picture of the content, "icon" for a type icon.
+    kind: &'static str,
+    width: u32,
+    height: u32,
+    src: String,
 }
 
 /// Everything the triage screen shows, sent after every change.
@@ -404,6 +426,51 @@ async fn file_current(state: State<'_, AppState>, id: String) -> Result<SessionV
     }
 }
 
+/// A preview of the file on the card, or of the next one so it's ready in
+/// time. Answers only for those two, so the interface can't ask about
+/// arbitrary paths. `None` when the shell has nothing for the file.
+#[tauri::command]
+async fn thumbnail(state: State<'_, AppState>, id: String) -> Result<Option<Arc<PreviewImage>>, String> {
+    let (path, key) = {
+        let guard = state.triage.lock().unwrap();
+        let triage = guard.as_ref().ok_or(NO_FOLDER)?;
+        let s = &triage.session;
+        let candidate = [s.current(), s.up_next()]
+            .into_iter()
+            .flatten()
+            .find(|c| c.id == id)
+            .ok_or("Previews are only made for the current and next file")?;
+        (candidate.path.clone(), format!("{}|{:?}", candidate.id, candidate.modified))
+    };
+    if let Some(cached) = state.thumbnails.lock().unwrap().get(&key) {
+        return Ok(cached.clone());
+    }
+
+    // The shell can take a moment, especially for a video's first frame.
+    let preview = tauri::async_runtime::spawn_blocking(move || {
+        dclutter_platform::thumbnail(&path, THUMBNAIL_SIZE).map(|t| {
+            Arc::new(PreviewImage {
+                kind: match t.kind {
+                    ThumbnailKind::Thumbnail => "thumbnail",
+                    ThumbnailKind::Icon => "icon",
+                },
+                width: t.width,
+                height: t.height,
+                src: format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(t.png)),
+            })
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut cache = state.thumbnails.lock().unwrap();
+    if cache.len() >= THUMBNAIL_CACHE {
+        cache.clear();
+    }
+    cache.insert(key, preview.clone());
+    Ok(preview)
+}
+
 /// Opens the file on the card in its default app. Takes no path, so the
 /// interface can only ever open the file it is showing.
 #[tauri::command]
@@ -455,6 +522,7 @@ pub fn run() {
                 destinations: Mutex::new(store.load()),
                 store,
                 sessions: SessionStore::new(app.path().app_data_dir()?.join("sessions")),
+                thumbnails: Mutex::new(HashMap::new()),
             });
             // The window starts hidden so it never shows at the wrong size.
             if let Some(window) = app.get_webview_window("main") {
@@ -476,6 +544,7 @@ pub fn run() {
             add_destination,
             remove_destination,
             file_current,
+            thumbnail,
             open_current
         ])
         .run(tauri::generate_context!())

@@ -11,6 +11,7 @@ mod locks;
 mod moves;
 mod scan;
 mod sessions;
+mod thumbnails;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod zone_identifier;
 
@@ -19,3 +20,4 @@ pub use destinations::{Destination, DestinationStore, MAX_DESTINATIONS};
 pub use moves::{MoveError, move_back, move_into_folder};
 pub use scan::{UNKNOWN_INTERNET_SOURCE, candidates_in};
 pub use sessions::SessionStore;
+pub use thumbnails::{Thumbnail, ThumbnailKind, thumbnail};
