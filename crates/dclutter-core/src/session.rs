@@ -255,6 +255,11 @@ impl TriageSession {
         self.queue.iter().filter(|c| self.is_pending(&c.id)).count()
     }
 
+    /// Every file in the session, decided or not, under its current name.
+    pub fn candidates(&self) -> &[FileCandidate] {
+        &self.queue
+    }
+
     pub fn total_count(&self) -> usize {
         self.queue.len()
     }

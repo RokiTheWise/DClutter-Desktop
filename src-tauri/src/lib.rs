@@ -149,6 +149,18 @@ impl Triage {
         }
     }
 
+    /// Brings name-based facts up to date after a file's name changed:
+    /// duplicates are found by name, so renaming "Report (2).pdf" can end
+    /// its "2 copies" chip, and scores are keyed by path.
+    fn names_changed(&mut self, renamed: Option<(&str, &str)>) {
+        if let Some((old_id, new_id)) = renamed {
+            if let Some(score) = self.scores.remove(old_id) {
+                self.scores.insert(new_id.to_owned(), score);
+            }
+        }
+        self.context = QueueContext::new(self.session.candidates());
+    }
+
     fn view(&self) -> SessionView {
         let s = &self.session;
         SessionView {
@@ -236,7 +248,13 @@ fn undo(state: State<'_, AppState>) -> Result<Change, String> {
         // record; a card for a file that isn't in the folder would fail at
         // every action.
         triage.session.redo();
-        return Err(format!("{e} It's still filed."));
+        return Err(match step.map(|s| s.kind) {
+            Some(DecisionKind::Rename) => format!("{e} It keeps its new name."),
+            _ => format!("{e} It's still filed."),
+        });
+    }
+    if step.as_ref().is_some_and(|s| s.kind == DecisionKind::Rename) {
+        triage.names_changed(None);
     }
     triage.save();
     Ok(Change { view: triage.view(), kind: step.map(|s| s.kind) })
@@ -250,6 +268,9 @@ fn redo(state: State<'_, AppState>) -> Result<Change, String> {
     if let Err(e) = carry_out(&step) {
         triage.session.undo();
         return Err(e.to_string());
+    }
+    if step.as_ref().is_some_and(|s| s.kind == DecisionKind::Rename) {
+        triage.names_changed(None);
     }
     triage.save();
     Ok(Change { view: triage.view(), kind: step.map(|s| s.kind) })
@@ -471,6 +492,37 @@ async fn thumbnail(state: State<'_, AppState>, id: String) -> Result<Option<Arc<
     Ok(preview)
 }
 
+/// Renames the file on the card in place. `name` is what was typed; the
+/// extension is kept if it was left off. The card stays, under its new
+/// name, and the rename can be undone.
+#[tauri::command(async)]
+fn rename_current(state: State<'_, AppState>, name: String) -> Result<SessionView, String> {
+    let mut guard = state.triage.lock().unwrap();
+    let triage = guard.as_mut().ok_or(NO_FOLDER)?;
+    let current = triage.session.current().ok_or("Nothing to rename")?;
+    let (id, path) = (current.id.clone(), current.path.clone());
+
+    let renamed = dclutter_platform::rename_in_place(&path, &name).map_err(|e| e.to_string())?;
+    if renamed != path {
+        let new_id = renamed.to_string_lossy().into_owned();
+        triage.session.rename(&id, renamed);
+        triage.names_changed(Some((&id, &new_id)));
+        triage.save();
+    }
+    Ok(triage.view())
+}
+
+/// Opens File Explorer with the card's file selected.
+#[tauri::command]
+fn reveal_current(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let path = {
+        let guard = state.triage.lock().unwrap();
+        let triage = guard.as_ref().ok_or(NO_FOLDER)?;
+        triage.session.current().ok_or("Nothing to show")?.path.clone()
+    };
+    app.opener().reveal_item_in_dir(path).map_err(|e| e.to_string())
+}
+
 /// Opens the file on the card in its default app. Takes no path, so the
 /// interface can only ever open the file it is showing.
 #[tauri::command]
@@ -545,6 +597,8 @@ pub fn run() {
             remove_destination,
             file_current,
             thumbnail,
+            rename_current,
+            reveal_current,
             open_current
         ])
         .run(tauri::generate_context!())
