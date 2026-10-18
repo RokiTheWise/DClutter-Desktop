@@ -31,6 +31,8 @@ export interface SessionView {
   trashed: number;
   canUndo: boolean;
   canRedo: boolean;
+  /** Files filed since the last commit, which Start Over would move back. */
+  filedThisSession: number;
 }
 
 /** A view plus the decision an undo or redo reversed or re-applied. */
@@ -133,6 +135,34 @@ export function renameCurrent(name: string): Promise<SessionView> {
 /** Opens File Explorer with the card's file selected. */
 export function revealCurrent(): Promise<void> {
   return invoke("reveal_current");
+}
+
+/** Mirrors `FolderMenu` in src-tauri/src/lib.rs. */
+export interface FolderMenu {
+  downloads: string;
+  /** Folders chosen before, newest first, never including Downloads. */
+  recents: string[];
+}
+
+export function folderMenu(): Promise<FolderMenu> {
+  return invoke("folder_menu");
+}
+
+/** Opens the system folder picker; null if cancelled. */
+export function pickSourceFolder(): Promise<string | null> {
+  return invoke("pick_source_folder");
+}
+
+/** Mirrors `StartOverOutcome` in src-tauri/src/lib.rs. */
+export interface StartOverOutcome {
+  view: SessionView;
+  movedBack: number;
+  error: string | null;
+}
+
+/** Makes every decision undecided and moves this session's filings back. */
+export function startOver(): Promise<StartOverOutcome> {
+  return invoke("start_over");
 }
 
 /** Opens the file on the card in its default app. */
