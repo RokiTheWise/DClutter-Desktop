@@ -2,8 +2,8 @@
 //  Copyright 2026 Dexter Jethro Enriquez
 //  Licensed under the Apache License, Version 2.0.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +37,8 @@ pub enum DecisionKind {
     File,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Decision {
     kind: DecisionKind,
     id: String,
@@ -87,9 +88,120 @@ pub struct TriageSession {
     sorted: usize,
 }
 
+/// A session saved to disk, so quitting mid-session costs nothing: the
+/// decisions, the skip order, and undo and redo all come back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSnapshot {
+    version: u32,
+    states: HashMap<String, FileState>,
+    deferred: Vec<String>,
+    history: Vec<Decision>,
+    redo_stack: Vec<Decision>,
+    sorted: usize,
+    /// Files filed into a destination. A fresh scan no longer finds them in
+    /// the folder, so they're kept here to rejoin the queue and stay
+    /// undoable after a relaunch. The macOS app drops them instead.
+    moved: Vec<FileCandidate>,
+}
+
+impl SessionSnapshot {
+    pub const VERSION: u32 = 1;
+
+    /// Whether this snapshot was written in a format this build reads.
+    pub fn is_current(&self) -> bool {
+        self.version == Self::VERSION
+    }
+}
+
 impl TriageSession {
     pub fn new(queue: Vec<FileCandidate>) -> Self {
         Self { queue, ..Self::default() }
+    }
+
+    /// Everything needed to pick this session up again later.
+    pub fn snapshot(&self) -> SessionSnapshot {
+        let moved = self
+            .queue
+            .iter()
+            .filter(|c| self.state(&c.id) == FileState::Moved)
+            .cloned()
+            .collect();
+        SessionSnapshot {
+            version: SessionSnapshot::VERSION,
+            states: self.states.clone(),
+            deferred: self.deferred.clone(),
+            history: self.history.clone(),
+            redo_stack: self.redo_stack.clone(),
+            sorted: self.sorted,
+            moved,
+        }
+    }
+
+    /// Starts a session on a freshly scanned and ranked `queue`, picking up
+    /// a saved one. The saved state is reconciled with what's on disk now:
+    ///
+    /// - Files no longer in the folder are dropped, so undo can never reach
+    ///   for something that isn't there. New files arrive as pending.
+    /// - A filed file rejoins the session, still undoable, only if it's
+    ///   still where it was filed (`exists` checks that path).
+    /// - Files trashed or filed earlier that are back in the folder, put
+    ///   back from the Recycle Bin or by hand, show up as pending again.
+    pub fn restore(
+        mut queue: Vec<FileCandidate>,
+        snapshot: SessionSnapshot,
+        exists: impl Fn(&Path) -> bool,
+    ) -> Self {
+        let mut present: HashSet<String> = queue.iter().map(|c| c.id.clone()).collect();
+
+        // Where each filed file was last recorded as landing.
+        let filed_to: HashMap<&str, &Path> = snapshot
+            .history
+            .iter()
+            .filter(|d| d.kind == DecisionKind::File)
+            .filter_map(|d| Some((d.id.as_str(), d.moved_to.as_deref()?)))
+            .collect();
+        let mut still_filed = HashSet::new();
+        for candidate in snapshot.moved {
+            let landed = filed_to.get(candidate.id.as_str()).copied();
+            if !present.contains(&candidate.id) && landed.is_some_and(&exists) {
+                still_filed.insert(candidate.id.clone());
+                present.insert(candidate.id.clone());
+                queue.push(candidate);
+            }
+        }
+
+        let states: HashMap<String, FileState> = snapshot
+            .states
+            .into_iter()
+            .filter(|(id, state)| match state {
+                FileState::Moved => still_filed.contains(id),
+                FileState::Trashed => false,
+                _ => present.contains(id),
+            })
+            .collect();
+
+        // The fresh ranking can put a decided file below a pending one. In a
+        // live session decided files always come first, which is what makes
+        // an undone file the next card; keep that true after a relaunch.
+        let (decided, pending): (Vec<_>, Vec<_>) =
+            queue.into_iter().partition(|c| states.contains_key(&c.id));
+        let queue = decided.into_iter().chain(pending).collect();
+        let keeps = |d: &Decision| {
+            present.contains(&d.id) && (d.kind != DecisionKind::File || still_filed.contains(&d.id))
+        };
+        // An undone filing sits in redo with the file back in the folder, so
+        // it only needs the file to be present.
+        let keeps_redo = |d: &Decision| present.contains(&d.id) && !still_filed.contains(&d.id);
+
+        Self {
+            states,
+            deferred: snapshot.deferred.into_iter().filter(|id| present.contains(id)).collect(),
+            history: snapshot.history.into_iter().filter(keeps).collect(),
+            redo_stack: snapshot.redo_stack.into_iter().filter(keeps_redo).collect(),
+            sorted: snapshot.sorted,
+            queue,
+        }
     }
 
     pub fn state(&self, id: &str) -> FileState {
@@ -562,6 +674,148 @@ mod tests {
         assert_eq!(s.state("a"), FileState::Moved);
         assert!(s.can_undo());
         assert!(!s.can_redo());
+    }
+
+    fn file(name: &str) -> FileCandidate {
+        FileCandidate {
+            id: name.to_owned(),
+            path: PathBuf::from(name),
+            bytes: 1024,
+            last_opened: None,
+            created: 0.0,
+            modified: None,
+            source_url: None,
+            is_directory: false,
+        }
+    }
+
+    fn files(names: &[&str]) -> Vec<FileCandidate> {
+        names.iter().map(|n| file(n)).collect()
+    }
+
+    /// Saves through JSON, as the app does, and restores onto `rescanned`.
+    fn relaunch(s: &TriageSession, rescanned: &[&str], exists: impl Fn(&Path) -> bool) -> TriageSession {
+        let json = serde_json::to_string(&s.snapshot()).unwrap();
+        let snapshot: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(snapshot.is_current());
+        TriageSession::restore(files(rescanned), snapshot, exists)
+    }
+
+    #[test]
+    fn decisions_skips_and_undo_survive_a_relaunch() {
+        let mut s = session(&["a", "b", "c", "d"]);
+        s.decide(Keep);
+        s.decide(Stage);
+        s.decide(Skip);
+        s.decide(Keep);
+        s.undo();
+
+        let mut s = relaunch(&s, &["a", "b", "c", "d"], |_| false);
+
+        assert_eq!(s.state("a"), FileState::Kept);
+        assert_eq!(s.state("b"), FileState::Staged);
+        assert_eq!(current(&s), Some("d"));
+        assert_eq!(s.sorted_count(), 2);
+        assert!(s.can_redo());
+        assert_eq!(redone(&mut s), Some(Keep));
+        assert_eq!(current(&s), Some("c"));
+        assert_eq!(undone(&mut s), Some(Keep));
+        assert_eq!(undone(&mut s), Some(Skip));
+        assert_eq!(undone(&mut s), Some(Stage));
+    }
+
+    #[test]
+    fn an_undone_file_comes_straight_back_even_if_it_now_ranks_lower() {
+        let mut s = session(&["a", "b", "c"]);
+        s.decide(Keep);
+
+        // After a relaunch, a now ranks last.
+        let mut s = relaunch(&s, &["b", "c", "a"], |_| false);
+
+        assert_eq!(current(&s), Some("b"));
+        assert_eq!(undone(&mut s), Some(Keep));
+        assert_eq!(current(&s), Some("a"));
+    }
+
+    #[test]
+    fn files_that_left_the_folder_are_dropped_and_new_ones_are_pending() {
+        let mut s = session(&["a", "b"]);
+        s.decide(Keep);
+        s.decide(Stage);
+
+        let s = relaunch(&s, &["b", "new"], |_| false);
+
+        assert_eq!(s.state("a"), FileState::Pending);
+        assert_eq!(s.state("b"), FileState::Staged);
+        assert_eq!(current(&s), Some("new"));
+        assert_eq!(s.total_count(), 2);
+        // Only b's stage is still undoable; a's keep went with a.
+        let mut s = s;
+        assert_eq!(undone(&mut s), Some(Stage));
+        assert!(!s.can_undo());
+    }
+
+    #[test]
+    fn a_filed_file_stays_undoable_after_a_relaunch() {
+        let mut s = session(&["a", "b"]);
+        s.begin_file(PathBuf::from("Invoices/a"));
+
+        let mut s = relaunch(&s, &["b"], |p| p == Path::new("Invoices/a"));
+
+        assert_eq!(s.state("a"), FileState::Moved);
+        assert_eq!(current(&s), Some("b"));
+        let step = s.undo().unwrap();
+        assert_eq!(step.disk, Some(DiskMove { from: PathBuf::from("Invoices/a"), to: PathBuf::from("a") }));
+        assert_eq!(current(&s), Some("a"));
+    }
+
+    #[test]
+    fn a_filed_file_that_has_since_moved_on_is_let_go() {
+        let mut s = session(&["a", "b"]);
+        s.begin_file(PathBuf::from("Invoices/a"));
+
+        let s = relaunch(&s, &["b"], |_| false);
+
+        assert_eq!(s.state("a"), FileState::Pending);
+        assert_eq!(s.total_count(), 1);
+        assert!(!s.can_undo());
+    }
+
+    #[test]
+    fn a_filed_file_put_back_by_hand_is_pending_again() {
+        let mut s = session(&["a", "b"]);
+        s.begin_file(PathBuf::from("Invoices/a"));
+
+        // The user dragged it back into Downloads themselves.
+        let s = relaunch(&s, &["a", "b"], |_| false);
+
+        assert_eq!(s.state("a"), FileState::Pending);
+        assert_eq!(current(&s), Some("a"));
+        assert!(!s.can_undo());
+    }
+
+    #[test]
+    fn an_undone_filing_can_still_be_redone_after_a_relaunch() {
+        let mut s = session(&["a", "b"]);
+        s.begin_file(PathBuf::from("Invoices/a"));
+        s.undo();
+
+        let mut s = relaunch(&s, &["a", "b"], |_| false);
+
+        let step = s.redo().unwrap();
+        assert_eq!(step.disk, Some(DiskMove { from: PathBuf::from("a"), to: PathBuf::from("Invoices/a") }));
+    }
+
+    #[test]
+    fn a_file_restored_from_the_recycle_bin_is_pending_again() {
+        let mut s = session(&["a", "b"]);
+        s.decide(Stage);
+        s.commit_trashed(["a"]);
+
+        let s = relaunch(&s, &["a", "b"], |_| false);
+
+        assert_eq!(s.state("a"), FileState::Pending);
+        assert_eq!(current(&s), Some("a"));
     }
 
     #[test]
