@@ -11,7 +11,7 @@ use dclutter_core::{
 };
 use base64::Engine;
 use dclutter_platform::{
-    Destination, DestinationStore, MAX_DESTINATIONS, SessionStore, ThumbnailKind,
+    Destination, DestinationStore, MAX_DESTINATIONS, RecentFolders, SessionStore, ThumbnailKind,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
@@ -32,6 +32,7 @@ struct AppState {
     destinations: Mutex<Vec<Destination>>,
     store: DestinationStore,
     sessions: SessionStore,
+    recents: RecentFolders,
     /// Recent previews, so going back to a card or undoing doesn't ask the
     /// shell again. Keyed by file and modification time.
     thumbnails: Mutex<HashMap<String, Option<Arc<PreviewImage>>>>,
@@ -68,6 +69,28 @@ struct SessionView {
     trashed: usize,
     can_undo: bool,
     can_redo: bool,
+    /// Files filed since the last commit, which Start Over would move back.
+    filed_this_session: usize,
+}
+
+/// What the folder menu offers.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderMenu {
+    downloads: PathBuf,
+    /// Folders chosen before, newest first. Downloads is never among them:
+    /// it's always offered, so the list is exactly "folders you chose".
+    recents: Vec<PathBuf>,
+}
+
+/// What Start Over did.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartOverOutcome {
+    view: SessionView,
+    moved_back: usize,
+    /// Set when some filed files couldn't be moved back. They stay filed.
+    error: Option<String>,
 }
 
 /// A staged file as the review-trash list shows it.
@@ -174,6 +197,7 @@ impl Triage {
             trashed: s.trashed_count(),
             can_undo: s.can_undo(),
             can_redo: s.can_redo(),
+            filed_this_session: s.filed_this_session(),
         }
     }
 }
@@ -222,9 +246,74 @@ async fn open_queue(
         .allow_directory(&triage.folder, false)
         .map_err(|e| e.to_string())?;
 
+    // Remember folders the user chose, for the folder menu.
+    let downloads = app.path().download_dir().ok();
+    if downloads.is_none_or(|d| !Destination::new(d).is_folder(&triage.folder)) {
+        if let Err(e) = state.recents.remember(&triage.folder) {
+            eprintln!("Couldn't remember {} as a recent folder: {e}", triage.folder.display());
+        }
+    }
+
     let view = triage.view();
     *state.triage.lock().unwrap() = Some(triage);
     Ok(view)
+}
+
+/// Downloads and the recently sorted folders, for the folder menu.
+#[tauri::command]
+fn folder_menu(app: AppHandle, state: State<'_, AppState>) -> Result<FolderMenu, String> {
+    let downloads = app.path().download_dir().map_err(|e| e.to_string())?;
+    let recents = state
+        .recents
+        .load()
+        .into_iter()
+        .filter(|p| !Destination::new(downloads.clone()).is_folder(p))
+        .collect();
+    Ok(FolderMenu { downloads, recents })
+}
+
+/// Asks the user for a folder to sort with the system picker. `None` if
+/// they cancelled. Opening it is a separate step, `open_queue`.
+#[tauri::command]
+async fn pick_source_folder(app: AppHandle) -> Option<PathBuf> {
+    app.dialog()
+        .file()
+        .set_title("Choose a folder to sort")
+        .blocking_pick_folder()
+        .and_then(|p| p.into_path().ok())
+}
+
+/// Start Over: every decision in this folder becomes undecided, and files
+/// filed since the last commit move back. Anything already in the Recycle
+/// Bin stays there.
+#[tauri::command(async)]
+fn start_over(state: State<'_, AppState>) -> Result<StartOverOutcome, String> {
+    let mut guard = state.triage.lock().unwrap();
+    let triage = guard.as_mut().ok_or(NO_FOLDER)?;
+
+    let mut moved_back = 0;
+    let mut errors = Vec::new();
+    for reversal in triage.session.reset() {
+        match dclutter_platform::move_back(&reversal.disk.from, &reversal.disk.to) {
+            Ok(()) => moved_back += 1,
+            Err(e) => {
+                // It's still in the destination, so keep it on record as
+                // filed rather than showing a card for a file that isn't here.
+                triage.session.restore_move(&reversal.id);
+                errors.push(e.to_string());
+            }
+        }
+    }
+    triage.save();
+
+    let error = match errors.as_slice() {
+        [] => None,
+        [only] => Some(format!("{only} It stays filed.")),
+        [first, rest @ ..] => {
+            Some(format!("{first} {} more couldn't be moved back either. They all stay filed.", rest.len()))
+        }
+    };
+    Ok(StartOverOutcome { view: triage.view(), moved_back, error })
 }
 
 #[tauri::command]
@@ -574,6 +663,7 @@ pub fn run() {
                 destinations: Mutex::new(store.load()),
                 store,
                 sessions: SessionStore::new(app.path().app_data_dir()?.join("sessions")),
+                recents: RecentFolders::new(app.path().app_config_dir()?.join("recent-folders.json")),
                 thumbnails: Mutex::new(HashMap::new()),
             });
             // The window starts hidden so it never shows at the wrong size.
@@ -587,6 +677,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             open_queue,
+            folder_menu,
+            pick_source_folder,
+            start_over,
             decide,
             undo,
             redo,

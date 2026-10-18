@@ -71,6 +71,13 @@ pub struct DiskMove {
     pub to: PathBuf,
 }
 
+/// A filed file that Start Over wants moved back to its folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reversal {
+    pub id: String,
+    pub disk: DiskMove,
+}
+
 /// What an undo or redo changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
@@ -270,6 +277,12 @@ impl TriageSession {
         self.sorted
     }
 
+    /// Files filed into a folder since the last commit: the ones Start Over
+    /// would bring back.
+    pub fn filed_this_session(&self) -> usize {
+        self.history.iter().filter(|d| d.kind == DecisionKind::File).count()
+    }
+
     /// Files moved to the Recycle Bin this session.
     pub fn trashed_count(&self) -> usize {
         self.states.values().filter(|s| **s == FileState::Trashed).count()
@@ -435,6 +448,39 @@ impl TriageSession {
         } else {
             DiskMove { from: original, to: moved_to }
         })
+    }
+
+    /// Start Over: every keep, stage and skip becomes undecided again, and
+    /// undo and redo are cleared. Returns the files filed since the last
+    /// commit, which the caller must move back; until then they are
+    /// pending again. A commit ends a session, so files already in the
+    /// Recycle Bin, or filed before the last commit, belong to a session
+    /// that's closed and are left alone. Renames stay.
+    pub fn reset(&mut self) -> Vec<Reversal> {
+        let reversals: Vec<Reversal> = self
+            .history
+            .iter()
+            .rev()
+            .filter(|d| d.kind == DecisionKind::File)
+            .filter_map(|d| Some(Reversal { id: d.id.clone(), disk: self.disk_move(d, true)? }))
+            .collect();
+        for reversal in &reversals {
+            self.states.remove(&reversal.id);
+        }
+        self.states.retain(|_, state| matches!(state, FileState::Trashed | FileState::Moved));
+        self.deferred.clear();
+        self.history.clear();
+        self.redo_stack.clear();
+        self.sorted = 0;
+        reversals
+    }
+
+    /// Puts a filing back on record after Start Over couldn't move the file
+    /// back, so the queue never claims a file is in the folder when it isn't.
+    pub fn restore_move(&mut self, id: &str) {
+        if self.queue.iter().any(|c| c.id == id) {
+            self.states.insert(id.to_owned(), FileState::Moved);
+        }
     }
 
     /// Un-stages files the user unticked when reviewing the trash. They
@@ -1009,6 +1055,69 @@ mod tests {
 
         assert_eq!(s.redo().unwrap().disk, Some(DiskMove { from: PathBuf::from("a"), to: PathBuf::from("Beach day") }));
         assert_eq!(current(&s), Some("Beach day"));
+    }
+
+    #[test]
+    fn starting_over_makes_every_decision_undecided() {
+        let mut s = session(&["a", "b", "c", "d"]);
+        s.decide(Keep);
+        s.decide(Stage);
+        s.decide(Skip);
+
+        assert!(s.reset().is_empty());
+
+        assert_eq!(s.remaining_count(), 4);
+        assert_eq!(current(&s), Some("a"));
+        assert!(s.staged().is_empty());
+        assert_eq!(s.sorted_count(), 0);
+        assert!(!s.can_undo());
+        assert!(!s.can_redo());
+    }
+
+    #[test]
+    fn starting_over_brings_filed_files_back_newest_first() {
+        let mut s = session(&["a", "b", "c"]);
+        s.begin_file(PathBuf::from("Invoices/a"));
+        s.begin_file(PathBuf::from("Photos/b"));
+        assert_eq!(s.filed_this_session(), 2);
+
+        let reversals = s.reset();
+
+        assert_eq!(
+            reversals,
+            [
+                Reversal { id: "b".into(), disk: DiskMove { from: PathBuf::from("Photos/b"), to: PathBuf::from("b") } },
+                Reversal { id: "a".into(), disk: DiskMove { from: PathBuf::from("Invoices/a"), to: PathBuf::from("a") } },
+            ]
+        );
+        assert_eq!(s.remaining_count(), 3);
+    }
+
+    #[test]
+    fn starting_over_leaves_trashed_files_and_files_filed_before_the_commit() {
+        let mut s = session(&["a", "b", "c", "d"]);
+        s.begin_file(PathBuf::from("Invoices/a"));
+        s.decide(Stage);
+        s.commit_trashed(["b"]);
+        s.decide(Keep);
+
+        let reversals = s.reset();
+
+        assert!(reversals.is_empty(), "a was filed before the commit");
+        assert_eq!(s.state("a"), FileState::Moved);
+        assert_eq!(s.state("b"), FileState::Trashed);
+        assert_eq!(s.state("c"), FileState::Pending);
+        assert_eq!(s.trashed_count(), 1);
+    }
+
+    #[test]
+    fn a_filing_that_could_not_be_moved_back_is_put_back_on_record() {
+        let mut s = session(&["a", "b"]);
+        s.begin_file(PathBuf::from("Invoices/a"));
+        s.reset();
+        s.restore_move("a");
+        assert_eq!(s.state("a"), FileState::Moved);
+        assert_eq!(current(&s), Some("b"));
     }
 
     #[test]
