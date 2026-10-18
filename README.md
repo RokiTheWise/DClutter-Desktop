@@ -7,15 +7,18 @@
 **Swipe to clean your files.**
 
 [![CI](https://img.shields.io/github/actions/workflow/status/RokiTheWise/DClutter-Windows/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI&labelColor=24292e)](https://github.com/RokiTheWise/DClutter-Windows/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/RokiTheWise/DClutter-Windows?style=flat-square&logo=github&logoColor=white&labelColor=24292e&color=orange)](https://github.com/RokiTheWise/DClutter-Windows/releases)
+[![Downloads](https://img.shields.io/github/downloads/RokiTheWise/DClutter-Windows/total.svg?style=flat-square&logo=github&logoColor=white&labelColor=24292e&color=blue)](https://github.com/RokiTheWise/DClutter-Windows/releases)
+[![Platform](https://img.shields.io/badge/Windows-10%20%7C%2011-lightgrey.svg?style=flat-square&logo=windows&logoColor=white&labelColor=24292e)](#install)
+
+**[⬇ Download DClutter for Windows 0.1.0](https://github.com/RokiTheWise/DClutter-Windows/releases/download/v0.1.0/DClutter_0.1.0_x64-setup.exe)**
+&nbsp;·&nbsp; [all releases](https://github.com/RokiTheWise/DClutter-Windows/releases)
 
 </div>
 
 The Windows (and later Linux) version of [DClutter](https://github.com/RokiTheWise/DClutter),
 built with [Tauri 2](https://tauri.app). It runs fully offline: the interface
 ships inside the app and every file operation happens on your machine.
-
-> **Status:** working, not yet released. Everything below runs from source;
-> installers come with the first release.
 
 ## What it does
 
@@ -49,6 +52,54 @@ File Explorer would show, plus the first page of every PDF.
 
 Right-click the card to open it, show it in File Explorer, rename it or copy
 its name.
+
+### Touchpad and mouse
+
+| Gesture | Action |
+|---|---|
+| Two fingers right / left | Keep / stage for trash |
+| Two fingers up, slide across, let go | File into the highlighted folder |
+| Drag back down | Close the shelf without filing |
+| Drag the card right / left | Keep / stage, with a mouse or a finger |
+
+If swipes run the wrong way, your touchpad is set to reverse scrolling; turn
+on **Reverse swipe direction** in Settings (`Ctrl+,`).
+
+## Install
+
+**[⬇ Download the installer](https://github.com/RokiTheWise/DClutter-Windows/releases/download/v0.1.0/DClutter_0.1.0_x64-setup.exe)**
+for Windows 10 or 11 (64-bit), or the
+[.msi](https://github.com/RokiTheWise/DClutter-Windows/releases/download/v0.1.0/DClutter_0.1.0_x64_en-US.msi)
+if you deploy with Group Policy or another tool that wants one.
+
+1. Run **DClutter_0.1.0_x64-setup.exe**.
+2. **Windows will probably say "Windows protected your PC". This is expected.**
+   Click **More info**, then **Run anyway**.
+3. Follow the installer. DClutter installs for your account only and needs no
+   administrator rights.
+
+It opens normally from then on. Uninstall it from **Settings → Apps →
+Installed apps** like any other app.
+
+DClutter uses WebView2, which comes with Windows 11 and with an up-to-date
+Windows 10. On the rare PC without it, the installer fetches it once; after
+that, DClutter never goes online.
+
+<details>
+<summary>Why does Windows warn about it?</summary>
+
+SmartScreen warns about any app that isn't signed with a code-signing
+certificate, which costs money every year, and that hasn't been downloaded
+often enough yet to build a reputation. This project doesn't have a
+certificate yet. The warning isn't a claim that something is wrong with the
+app.
+
+What you can do instead of taking that on trust: the entire source is in this
+repository, and you can build it yourself (see [Development](#development)),
+which skips the warning because nothing you build locally is marked as
+downloaded.
+
+</details>
 
 ## Layout
 
