@@ -35,6 +35,9 @@ pub enum DecisionKind {
     Skip,
     /// Filed into a destination folder.
     File,
+    /// Renamed in place. Not a decision about the file, so it doesn't
+    /// count as sorted and the card stays, but it can be undone.
+    Rename,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,8 +45,22 @@ pub enum DecisionKind {
 struct Decision {
     kind: DecisionKind,
     id: String,
-    /// Where a filed file now is. Set only for `File`.
+    /// Where a filed or renamed file now is. Set for `File` and `Rename`.
     moved_to: Option<PathBuf>,
+    /// Where a renamed file was before. Set only for `Rename`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    renamed_from: Option<PathBuf>,
+}
+
+impl Decision {
+    /// The id of the file this decision is about, as it's named right now.
+    /// An undone rename sits in redo with the file back at its old path.
+    fn id_while_undone(&self) -> String {
+        match (&self.kind, &self.renamed_from) {
+            (DecisionKind::Rename, Some(from)) => from.to_string_lossy().into_owned(),
+            _ => self.id.clone(),
+        }
+    }
 }
 
 /// Disk work the caller must do for the folder to match the session. The
@@ -192,7 +209,8 @@ impl TriageSession {
         };
         // An undone filing sits in redo with the file back in the folder, so
         // it only needs the file to be present.
-        let keeps_redo = |d: &Decision| present.contains(&d.id) && !still_filed.contains(&d.id);
+        let keeps_redo =
+            |d: &Decision| present.contains(&d.id_while_undone()) && !still_filed.contains(&d.id);
 
         Self {
             states,
@@ -269,11 +287,12 @@ impl TriageSession {
     /// nothing, when there is no current file.
     pub fn decide(&mut self, kind: DecisionKind) -> bool {
         let Some(id) = self.current().map(|c| c.id.clone()) else { return false };
-        // Filing goes through `begin_file`, which needs a destination.
-        if kind == DecisionKind::File {
+        // Filing and renaming go through `begin_file` and `rename`, which
+        // need a destination or a name.
+        if matches!(kind, DecisionKind::File | DecisionKind::Rename) {
             return false;
         }
-        let decision = Decision { kind, id, moved_to: None };
+        let decision = Decision { kind, id, moved_to: None, renamed_from: None };
         self.apply(&decision);
         // A skip that doesn't change the visible file (it was the only one
         // left) shouldn't leave a dead undo entry, or undo appears to do
@@ -294,11 +313,63 @@ impl TriageSession {
     pub fn begin_file(&mut self, planned: PathBuf) -> Option<(String, PathBuf)> {
         let current = self.current()?;
         let (id, path) = (current.id.clone(), current.path.clone());
-        let decision = Decision { kind: DecisionKind::File, id: id.clone(), moved_to: Some(planned) };
+        let decision =
+            Decision { kind: DecisionKind::File, id: id.clone(), moved_to: Some(planned), renamed_from: None };
         self.apply(&decision);
         self.history.push(decision);
         self.redo_stack.clear();
         Some((id, path))
+    }
+
+    /// Records that the file `id` has been renamed on disk to `new_path`,
+    /// so undo can rename it back. Call after the rename succeeded. The
+    /// session is keyed by path throughout, so everything about the file,
+    /// its state, skip order and undo history, follows it to the new name.
+    /// Returns false if `id` isn't in the session.
+    pub fn rename(&mut self, id: &str, new_path: PathBuf) -> bool {
+        let Some(old_path) = self.queue.iter().find(|c| c.id == id).map(|c| c.path.clone()) else {
+            return false;
+        };
+        self.rekey(id, new_path.clone());
+        self.history.push(Decision {
+            kind: DecisionKind::Rename,
+            id: new_path.to_string_lossy().into_owned(),
+            moved_to: Some(new_path),
+            renamed_from: Some(old_path),
+        });
+        self.redo_stack.clear();
+        true
+    }
+
+    /// Points everything recorded under `old_id` at `new_path` instead.
+    fn rekey(&mut self, old_id: &str, new_path: PathBuf) {
+        let new_id = new_path.to_string_lossy().into_owned();
+        let Some(candidate) = self.queue.iter_mut().find(|c| c.id == old_id) else { return };
+        let old_path = std::mem::replace(&mut candidate.path, new_path.clone());
+        candidate.id = new_id.clone();
+
+        if let Some(state) = self.states.remove(old_id) {
+            self.states.insert(new_id.clone(), state);
+        }
+        for deferred in self.deferred.iter_mut().filter(|d| *d == old_id) {
+            *deferred = new_id.clone();
+        }
+        for decision in self.history.iter_mut().chain(self.redo_stack.iter_mut()) {
+            if decision.id == old_id {
+                decision.id = new_id.clone();
+            }
+            // Earlier renames of this file: keep both of their ends on the
+            // file's real paths. A filing's moved_to is its destination,
+            // which a rename here doesn't change.
+            if decision.kind == DecisionKind::Rename {
+                if decision.moved_to.as_ref() == Some(&old_path) {
+                    decision.moved_to = Some(new_path.clone());
+                }
+                if decision.renamed_from.as_ref() == Some(&old_path) {
+                    decision.renamed_from = Some(new_path.clone());
+                }
+            }
+        }
     }
 
     /// Corrects where the last filed file landed. The folder may have
@@ -346,6 +417,13 @@ impl TriageSession {
     /// The move that undoes (`back`) or redoes a filing.
     fn disk_move(&self, decision: &Decision, back: bool) -> Option<DiskMove> {
         let moved_to = decision.moved_to.clone()?;
+        if let Some(from) = decision.renamed_from.clone() {
+            return Some(if back {
+                DiskMove { from: moved_to, to: from }
+            } else {
+                DiskMove { from, to: moved_to }
+            });
+        }
         let original = self.queue.iter().find(|c| c.id == decision.id)?.path.clone();
         Some(if back {
             DiskMove { from: moved_to, to: original }
@@ -390,6 +468,11 @@ impl TriageSession {
             DecisionKind::Keep => self.set_decided(id, FileState::Kept),
             DecisionKind::Stage => self.set_decided(id, FileState::Staged),
             DecisionKind::File => self.set_decided(id, FileState::Moved),
+            DecisionKind::Rename => {
+                if let (Some(from), Some(to)) = (&decision.renamed_from, &decision.moved_to) {
+                    self.rekey(&from.to_string_lossy(), to.clone());
+                }
+            }
             DecisionKind::Skip => {
                 self.deferred.retain(|d| d != id);
                 self.deferred.push(id.clone());
@@ -405,6 +488,11 @@ impl TriageSession {
                 self.sorted = self.sorted.saturating_sub(1);
             }
             DecisionKind::Skip => self.deferred.retain(|d| d != id),
+            DecisionKind::Rename => {
+                if let Some(from) = &decision.renamed_from {
+                    self.rekey(id, from.clone());
+                }
+            }
         }
     }
 
@@ -419,7 +507,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    use DecisionKind::{File, Keep, Skip, Stage};
+    use DecisionKind::{File, Keep, Rename, Skip, Stage};
 
     fn session(names: &[&str]) -> TriageSession {
         TriageSession::new(
@@ -816,6 +904,106 @@ mod tests {
 
         assert_eq!(s.state("a"), FileState::Pending);
         assert_eq!(current(&s), Some("a"));
+    }
+
+    fn path_of(s: &TriageSession, id: &str) -> Option<PathBuf> {
+        s.queue.iter().find(|c| c.id == id).map(|c| c.path.clone())
+    }
+
+    #[test]
+    fn renaming_keeps_the_card_under_its_new_name() {
+        let mut s = session(&["a", "b"]);
+        assert!(s.rename("a", PathBuf::from("Beach day")));
+
+        assert_eq!(current(&s), Some("Beach day"));
+        assert_eq!(s.current().unwrap().path, PathBuf::from("Beach day"));
+        assert_eq!(s.sorted_count(), 0);
+        assert_eq!(s.remaining_count(), 2);
+        assert!(s.can_undo());
+    }
+
+    #[test]
+    fn decide_cannot_rename_without_a_name() {
+        let mut s = session(&["a"]);
+        assert!(!s.decide(Rename));
+        assert!(!s.can_undo());
+    }
+
+    #[test]
+    fn renaming_an_unknown_file_does_nothing() {
+        let mut s = session(&["a"]);
+        assert!(!s.rename("nope", PathBuf::from("x")));
+        assert!(!s.can_undo());
+    }
+
+    #[test]
+    fn undoing_a_rename_asks_for_the_old_name_back() {
+        let mut s = session(&["a", "b"]);
+        s.rename("a", PathBuf::from("Beach day"));
+
+        let step = s.undo().unwrap();
+
+        assert_eq!(step.kind, Rename);
+        assert_eq!(step.disk, Some(DiskMove { from: PathBuf::from("Beach day"), to: PathBuf::from("a") }));
+        assert_eq!(current(&s), Some("a"));
+
+        let step = s.redo().unwrap();
+        assert_eq!(step.disk, Some(DiskMove { from: PathBuf::from("a"), to: PathBuf::from("Beach day") }));
+        assert_eq!(current(&s), Some("Beach day"));
+    }
+
+    #[test]
+    fn a_rename_carries_the_files_decision_and_history_with_it() {
+        let mut s = session(&["a", "b"]);
+        s.decide(Skip); // a deferred behind b
+        s.decide(Keep); // b kept, a is back
+        s.rename("a", PathBuf::from("a2"));
+        s.decide(Stage);
+
+        assert_eq!(s.state("a2"), FileState::Staged);
+        assert_eq!(s.state("a"), FileState::Pending);
+        assert_eq!(undone(&mut s), Some(Stage));
+        assert_eq!(current(&s), Some("a2"));
+        assert_eq!(undone(&mut s), Some(Rename));
+        assert_eq!(undone(&mut s), Some(Keep));
+        // The skip was recorded against a; it still finds the file.
+        assert_eq!(undone(&mut s), Some(Skip));
+        assert_eq!(current(&s), Some("a"));
+    }
+
+    #[test]
+    fn renaming_twice_undoes_one_step_at_a_time() {
+        let mut s = session(&["a"]);
+        s.rename("a", PathBuf::from("b"));
+        s.rename("b", PathBuf::from("c"));
+
+        assert_eq!(s.undo().unwrap().disk, Some(DiskMove { from: PathBuf::from("c"), to: PathBuf::from("b") }));
+        assert_eq!(s.undo().unwrap().disk, Some(DiskMove { from: PathBuf::from("b"), to: PathBuf::from("a") }));
+        assert_eq!(path_of(&s, "a"), Some(PathBuf::from("a")));
+    }
+
+    #[test]
+    fn a_rename_and_its_undo_survive_a_relaunch() {
+        let mut s = session(&["a", "b"]);
+        s.rename("a", PathBuf::from("Beach day"));
+
+        let mut s = relaunch(&s, &["Beach day", "b"], |_| false);
+
+        assert_eq!(s.undo().unwrap().disk, Some(DiskMove { from: PathBuf::from("Beach day"), to: PathBuf::from("a") }));
+        assert_eq!(current(&s), Some("a"));
+    }
+
+    #[test]
+    fn an_undone_rename_can_be_redone_after_a_relaunch() {
+        let mut s = session(&["a", "b"]);
+        s.rename("a", PathBuf::from("Beach day"));
+        s.undo();
+
+        // The file is back under its old name on disk.
+        let mut s = relaunch(&s, &["a", "b"], |_| false);
+
+        assert_eq!(s.redo().unwrap().disk, Some(DiskMove { from: PathBuf::from("a"), to: PathBuf::from("Beach day") }));
+        assert_eq!(current(&s), Some("Beach day"));
     }
 
     #[test]
