@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "dclutter-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "regex",
  "serde",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "dclutter-desktop"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "dclutter-core",
@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "dclutter-platform"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "dclutter-core",
  "png 0.18.1",
