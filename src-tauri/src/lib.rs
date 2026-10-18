@@ -275,9 +275,10 @@ fn folder_menu(app: AppHandle, state: State<'_, AppState>) -> Result<FolderMenu,
 /// Asks the user for a folder to sort with the system picker. `None` if
 /// they cancelled. Opening it is a separate step, `open_queue`.
 #[tauri::command]
-async fn pick_source_folder(app: AppHandle) -> Option<PathBuf> {
+async fn pick_source_folder(app: AppHandle, window: WebviewWindow) -> Option<PathBuf> {
     app.dialog()
         .file()
+        .set_parent(&window)
         .set_title("Choose a folder to sort")
         .blocking_pick_folder()
         .and_then(|p| p.into_path().ok())
@@ -446,7 +447,11 @@ fn list_destinations(state: State<'_, AppState>) -> Vec<DestinationItem> {
 /// a new one, and adds it to the shelf. Returns the new list, unchanged if
 /// the picker was cancelled.
 #[tauri::command]
-async fn add_destination(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<DestinationItem>, String> {
+async fn add_destination(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<Vec<DestinationItem>, String> {
     if state.destinations.lock().unwrap().len() >= MAX_DESTINATIONS {
         return Err(
             "Three folders is the maximum. Highlight one on the shelf and press Delete to free a slot.".into(),
@@ -456,7 +461,15 @@ async fn add_destination(app: AppHandle, state: State<'_, AppState>) -> Result<V
     // The folder you need often doesn't exist yet; you realise it the
     // moment a file demands one. The Windows picker's New folder button
     // covers that without sending anyone to Explorer.
-    let picked = app.dialog().file().set_title("Choose a folder to file into").blocking_pick_folder();
+    // Owned by the window, so it always opens in front of it (a touchpad
+    // gesture doesn't bring the app forward the way a click does) and the
+    // app waits for it.
+    let picked = app
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("Choose a folder to file into")
+        .blocking_pick_folder();
     let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
         return Ok(list_destinations(state));
     };
