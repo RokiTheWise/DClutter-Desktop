@@ -16,7 +16,7 @@
   import SettingsPanel, { type SettingsSection } from "$lib/components/SettingsPanel.svelte";
   import { HeldDecision } from "$lib/held";
   import { loadHoldSpeed, loadSwipeReversed, saveHoldSpeed, saveSwipeReversed } from "$lib/settings";
-  import { SWIPE, SwipeTracker, isMouseWheel, type Intent } from "$lib/swipe";
+  import { SWIPE, SwipeTracker, isMouseWheel, type Intent, type TouchInput } from "$lib/swipe";
   import * as session from "$lib/session";
   import type { DecisionKind, DestinationItem, SessionView, StagedItem } from "$lib/session";
 
@@ -161,7 +161,7 @@
   // The app reads finger contacts from the touchpad itself, so a gesture
   // starts on touch and ends on lift instead of after a quiet moment.
   $effect(() => {
-    const stop = listen<number>("touchpad", (e) => act(tracker.fingers(e.payload)));
+    const stop = listen<TouchInput>("touchpad", (e) => act(tracker.touch(e.payload)));
     return () => {
       stop.then((unlisten) => unlisten());
     };

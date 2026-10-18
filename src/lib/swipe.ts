@@ -15,7 +15,9 @@
  * - A swipe that stopped short springs back when the fingers lift.
  * - Swiping up opens the shelf and carries straight on into choosing a bin
  *   by sliding sideways; lifting files into it, and dragging back down
- *   cancels.
+ *   cancels. Once a two-finger scroll starts vertically Windows holds it to
+ *   that axis, so the sliding is followed from the fingers' positions, not
+ *   from scrolling.
  *
  * Touchpads that don't report contacts fall back to inferring a gesture's
  * end from a quiet moment. Without a lift event the coasting tail would
@@ -25,6 +27,14 @@
  * Pure and clock-free: the caller feeds events and the time, and calls
  * `tick` once things may have gone quiet.
  */
+
+/** What the touchpad reports: fingers down, and their middle as 0 to 1
+ *  across the touchpad from its top-left corner (null if unknown). */
+export interface TouchInput {
+  fingers: number;
+  x: number | null;
+  y: number | null;
+}
 
 export interface WheelInput {
   dx: number;
@@ -63,6 +73,10 @@ export const SWIPE = {
   cancelDown: 50,
   /** Without contacts, a gesture that's been quiet this long has ended. */
   quietMs: 150,
+  /** Finger travel across the whole touchpad, in the same pixels as
+   *  scrolling: a bin is then about a tenth of the touchpad's width. */
+  padWidth: 600,
+  padHeight: 400,
 } as const;
 
 type Phase =
@@ -83,6 +97,10 @@ export class SwipeTracker {
   private touching = false;
   /** Whether the shelf was already open when this gesture began. */
   private startedOnShelf = false;
+  /** Where the fingers were last, while the count stays the same. */
+  private lastAt: { x: number; y: number; fingers: number } | null = null;
+  /** Whether the touchpad reports positions, so steering follows them. */
+  private positions = false;
 
   /**
    * @param reversed Users who set Windows to reverse touchpad scrolling
@@ -94,6 +112,26 @@ export class SwipeTracker {
     private reversed: () => boolean,
     private onShelf: () => boolean,
   ) {}
+
+  /** The touchpad reported fingers touching, moving or lifting. */
+  touch({ fingers, x, y }: TouchInput): Intent[] {
+    const intents = this.fingers(fingers);
+    if (fingers === 0 || x === null || y === null) {
+      this.lastAt = null;
+      return intents;
+    }
+    this.positions = true;
+    const last = this.lastAt;
+    this.lastAt = { x, y, fingers };
+    // Only compare like with like: the middle jumps when a finger lands.
+    if (!last || last.fingers !== fingers || this.phase.kind !== "steering") return intents;
+    const phase = this.phase;
+    // Positions are where the fingers really are, so unlike scrolling
+    // they never need reversing.
+    phase.x += (x - last.x) * SWIPE.padWidth;
+    phase.y += (last.y - y) * SWIPE.padHeight;
+    return [...intents, ...this.steer(phase)];
+  }
 
   /** The number of fingers on the touchpad changed. */
   fingers(count: number): Intent[] {
@@ -154,6 +192,8 @@ export class SwipeTracker {
         phase.y += up;
         return [...intents, ...this.advance()];
       case "steering":
+        // Followed from finger positions where the touchpad gives them.
+        if (this.positions) return intents;
         phase.x += right;
         phase.y += up;
         return [...intents, ...this.steer(phase)];

@@ -134,12 +134,25 @@ describe("telling a mouse wheel from a touchpad", () => {
 });
 
 describe("with a touchpad that reports finger contacts", () => {
-  /** Like setup, but the fingers touch before and lift after each swipe. */
-  function contacts({ shelf = false } = {}) {
+  /** Like setup, but the fingers touch before and lift after each swipe,
+   *  and their position can be moved directly. */
+  function contacts({ shelf = false, positions = false } = {}) {
     const base = setup({ shelf });
     const { tracker, state } = base;
-    const touch = () => tracker.fingers(2);
-    const lift = () => tracker.fingers(0);
+    let at = { x: 0.5, y: 0.5 };
+    const report = () => tracker.touch({ fingers: 2, x: positions ? at.x : null, y: positions ? at.y : null });
+    const touch = () => report();
+    const lift = () => tracker.touch({ fingers: 0, x: null, y: null });
+    /** Fingers slide by this fraction of the touchpad, in small steps;
+     *  positive x is right and positive y is down, as the touchpad reports. */
+    const slide = (dx: number, dy: number, steps = 10) => {
+      const out: Intent[] = [];
+      for (let i = 0; i < steps; i++) {
+        at = { x: at.x + dx / steps, y: at.y + dy / steps };
+        out.push(...report());
+      }
+      return out;
+    };
     // The shelf opens when the page acts on "up".
     const follow = (intents: Intent[]) => {
       for (const i of intents) {
@@ -148,7 +161,7 @@ describe("with a touchpad that reports finger contacts", () => {
       }
       return intents;
     };
-    return { ...base, touch, lift, follow };
+    return { ...base, touch, lift, slide, follow };
   }
 
   it("lets swipes follow each other straight away, without a pause", () => {
@@ -202,6 +215,28 @@ describe("with a touchpad that reports finger contacts", () => {
     expect(lift()).toEqual([]);
   });
 
+  it("follows the fingers sliding sideways, though scrolling stays vertical", () => {
+    const { swipe, touch, lift, slide, follow } = contacts({ positions: true });
+    touch();
+    // Up opens the shelf...
+    expect(types(follow(swipe(0, FINGERS_UP * SWIPE.step * 1.2)))).toEqual(["up"]);
+    // ...and Windows keeps reporting only vertical scrolling from here on,
+    // which must not move the highlight or cancel anything.
+    expect(follow(swipe(0, FINGERS_UP * 40))).toEqual([]);
+    // Sliding right a fifth of the touchpad is two bins.
+    expect(types(follow(slide(0.21, 0)))).toEqual(["right", "right"]);
+    expect(types(follow(slide(-0.12, 0)))).toEqual(["left"]);
+    expect(types(follow(lift()))).toEqual(["release"]);
+  });
+
+  it("sliding the fingers back down cancels, from their position", () => {
+    const { swipe, touch, slide, follow } = contacts({ positions: true });
+    touch();
+    follow(swipe(0, FINGERS_UP * SWIPE.step * 1.2));
+    // Down a sixth of the touchpad's height is past the cancel distance.
+    expect(types(follow(slide(0, 0.17)))).toEqual(["down"]);
+  });
+
   it("a shelf opened with the keyboard still takes one step per swipe", () => {
     const { swipe, touch, lift } = contacts({ shelf: true });
     touch();
@@ -217,5 +252,18 @@ describe("with a touchpad that reports finger contacts", () => {
     lift();
     touch();
     expect(types(swipe(FINGERS_RIGHT * SWIPE.full, 0))).toContain("keep");
+  });
+});
+
+describe("finger positions with reversed scrolling", () => {
+  it("still follow the fingers the way they really move", () => {
+    const tracker = new SwipeTracker(() => true, () => false);
+    let t = 0;
+    tracker.touch({ fingers: 2, x: 0.5, y: 0.5 });
+    // Reversed: fingers up scroll the other way, so dy is negative.
+    for (let i = 0; i < 10; i++) tracker.wheel({ dx: 0, dy: -SWIPE.step * 0.12, t: (t += 8) });
+    const out: Intent[] = [];
+    for (let i = 1; i <= 10; i++) out.push(...tracker.touch({ fingers: 2, x: 0.5 + 0.012 * i, y: 0.5 }));
+    expect(types(out)).toEqual(["right"]);
   });
 });
