@@ -3,11 +3,12 @@
   import { cubicIn, cubicOut } from "svelte/easing";
   import { fly } from "svelte/transition";
   import Card from "$lib/components/Card.svelte";
-  import CardMenu from "$lib/components/CardMenu.svelte";
+  import ConfirmDialog, { type DialogAction } from "$lib/components/ConfirmDialog.svelte";
   import DecisionButton from "$lib/components/DecisionButton.svelte";
   import DestinationShelf from "$lib/components/DestinationShelf.svelte";
   import Icon from "$lib/components/Icon.svelte";
   import IconButton from "$lib/components/IconButton.svelte";
+  import PopupMenu, { type MenuItem } from "$lib/components/PopupMenu.svelte";
   import { IMAGE_EXTENSIONS } from "$lib/components/Preview.svelte";
   import RenameField from "$lib/components/RenameField.svelte";
   import ReviewTrash from "$lib/components/ReviewTrash.svelte";
@@ -33,8 +34,11 @@
   let reviewBusy = $state(false);
   let reviewError = $state<string | null>(null);
 
-  /** Where the card's right-click menu is open, if it is. */
-  let menu = $state<{ x: number; y: number } | null>(null);
+  /** The open pop-up menu, if any, and where. */
+  let popup = $state<{ kind: "card" | "folder" | "more"; x: number; y: number } | null>(null);
+  let folderChoices = $state<session.FolderMenu | null>(null);
+  /** An open question: Start Over, or switching with files staged. */
+  let confirm = $state<{ title: string; message: string; actions: DialogAction[] } | null>(null);
 
   let renaming = $state(false);
   let renameBusy = $state(false);
@@ -62,7 +66,7 @@
   function openSettings(section: SettingsSection) {
     held.stop();
     shelfOpen = false;
-    menu = null;
+    popup = null;
     settingsSection = section;
     settingsOpen = true;
   }
@@ -296,6 +300,163 @@
     }
   }
 
+  const sameFolder = (a: string, b: string) =>
+    a.replace(/[\\/]+$/, "").toLowerCase() === b.replace(/[\\/]+$/, "").toLowerCase();
+  const filesWord = (n: number) => (n === 1 ? "1 file" : `${n} files`);
+
+  const cardItems = (): MenuItem[] => [
+    { label: "Open", hint: "Enter", onSelect: open },
+    { label: "Show in Explorer", onSelect: reveal },
+    "separator",
+    { label: "Rename…", hint: "F2", onSelect: startRename },
+    { label: "Copy name", onSelect: copyName },
+  ];
+
+  function folderItems(): MenuItem[] {
+    const choices = folderChoices;
+    if (!choices || !view) return [];
+    const here = view.folder;
+    const items: MenuItem[] = [
+      { label: "Downloads", checked: sameFolder(here, choices.downloads), onSelect: () => requestSwitch(choices.downloads) },
+    ];
+    if (choices.recents.length > 0) {
+      items.push("separator");
+      for (const folder of choices.recents) {
+        items.push({ label: folder, checked: sameFolder(here, folder), onSelect: () => requestSwitch(folder) });
+      }
+    }
+    items.push("separator", { label: "Choose Folder…", onSelect: chooseFolder });
+    return items;
+  }
+
+  const moreItems = (): MenuItem[] => [
+    { label: "Start Over…", onSelect: confirmStartOver },
+    { label: "Controls & keys", hint: "?", onSelect: () => openSettings("controls") },
+  ];
+
+  async function openFolderMenu(e: MouseEvent) {
+    const anchor = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    held.stop();
+    folderChoices = await session.folderMenu().catch(() => null);
+    popup = { kind: "folder", x: anchor.left, y: anchor.bottom + 4 };
+  }
+
+  function openMoreMenu(e: MouseEvent) {
+    const anchor = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    held.stop();
+    popup = { kind: "more", x: anchor.right, y: anchor.bottom + 4 };
+  }
+
+  /** Switches to `folder`, first asking about any files still staged. */
+  function requestSwitch(folder: string) {
+    if (!view || sameFolder(folder, view.folder)) return;
+    const staged = view.staged;
+    if (staged === 0) {
+      switchTo(folder);
+      return;
+    }
+    confirm = {
+      title: "Switch folders?",
+      message: `${staged === 1 ? "1 file is" : `${staged} files are`} staged for trash in this folder. Files you already filed into folders stay where they are either way.`,
+      actions: [
+        {
+          label: "Leave them staged",
+          kind: "secondary",
+          onSelect: () => {
+            confirm = null;
+            switchTo(folder);
+          },
+        },
+        {
+          label: `Trash ${filesWord(staged)}`,
+          onSelect: () => {
+            confirm = null;
+            trashThenSwitch(folder);
+          },
+        },
+      ],
+    };
+  }
+
+  function switchTo(folder: string) {
+    held.stop();
+    shelfOpen = false;
+    renaming = false;
+    notice = null;
+    status = null;
+    enqueue(async () => {
+      // Each folder has its own saved session, so this picks up where the
+      // last visit to it left off.
+      const next = await session.openQueue(folder);
+      exit = "fade";
+      entrance = "rise";
+      view = next;
+    });
+  }
+
+  /** Trashes everything staged, then switches. If anything couldn't be
+   *  trashed, stays and shows the review list with the error instead, so
+   *  a partial failure is never mistaken for success. */
+  function trashThenSwitch(folder: string) {
+    enqueue(async () => {
+      const outcome = await session.commitTrash([]);
+      view = outcome.view;
+      if (outcome.error) {
+        reviewError = outcome.error;
+        review = await session.stagedFiles();
+        if (review.length === 0) review = null;
+      } else {
+        switchTo(folder);
+      }
+    });
+  }
+
+  function chooseFolder() {
+    enqueue(async () => {
+      const folder = await session.pickSourceFolder();
+      if (folder) requestSwitch(folder);
+    });
+  }
+
+  /** Says what Start Over will do to files on disk: nobody can eyeball
+   *  twenty files coming back. */
+  function confirmStartOver() {
+    if (!view) return;
+    const lines = ["Every keep, trash and skip decision in this folder becomes undecided again."];
+    const filed = view.filedThisSession;
+    if (filed > 0) {
+      lines.push(`${filesWord(filed)} you filed into ${filed === 1 ? "a folder moves" : "folders move"} back to ${folderName}.`);
+    }
+    if (view.trashed > 0) lines.push("Files already in the Recycle Bin stay there.");
+    confirm = {
+      title: "Start over?",
+      message: lines.join(" "),
+      actions: [
+        {
+          label: "Start over",
+          onSelect: () => {
+            confirm = null;
+            startOver();
+          },
+        },
+      ],
+    };
+  }
+
+  function startOver() {
+    held.stop();
+    notice = null;
+    status = null;
+    enqueue(async () => {
+      const outcome = await session.startOver();
+      exit = "fade";
+      entrance = "rise";
+      view = outcome.view;
+      status = outcome.movedBack > 0 ? `Started over. ${filesWord(outcome.movedBack)} moved back.` : "Started over.";
+      if (outcome.error) notice = outcome.error;
+    });
+  }
+
   function open() {
     if (!view?.current) return;
     session.openCurrent().catch((e) => {
@@ -306,7 +467,7 @@
   function onkeydown(e: KeyboardEvent) {
     // The review list, the rename field, the menu and the settings handle
     // their own keys.
-    if (!view || review || renaming || menu || settingsOpen) return;
+    if (!view || review || renaming || popup || settingsOpen || confirm) return;
 
     // While the shelf is open the arrows steer it instead of deciding.
     if (shelfOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
@@ -477,7 +638,17 @@
       </span>
 
       <div class="folder">
-        <span class="folder-name">{folderName}</span>
+        <!-- Reads as a location, but it's a menu: click to switch folders. -->
+        <button
+          class="folder-name"
+          tabindex="-1"
+          onmousedown={(e) => e.preventDefault()}
+          onclick={openFolderMenu}
+          title="Sorting {view.folder}. Click to switch folders"
+        >
+          {folderName}
+          <Icon name="chevron-down" size={12} />
+        </button>
         <span class="folder-path" title={view.folder}>{view.folder}</span>
       </div>
 
@@ -499,6 +670,8 @@
         Review trash
         <span class="count">{view.staged}</span>
       </button>
+
+      <IconButton title="More" icon="more" onclick={openMoreMenu} />
       {#if settingsOpen}
         <SettingsPanel bind:section={settingsSection} bind:holdSpeed onClose={() => (settingsOpen = false)} />
       {/if}
@@ -508,7 +681,7 @@
       {#if view.current}
         {#key view.current.id}
           <div class="slot" class:behind-shelf={shelfOpen} in:cardIn|global={{ from: entrance }} out:cardOut|global={{ exit }}>
-            <Card item={view.current} onOpen={open} onMenu={(x, y) => (menu = { x, y })} />
+            <Card item={view.current} onOpen={open} onMenu={(x, y) => (popup = { kind: "card", x, y })} />
           </div>
         {/key}
       {:else}
@@ -571,15 +744,22 @@
     </footer>
   </main>
 
-  {#if menu && view.current}
-    <CardMenu
-      x={menu.x}
-      y={menu.y}
-      onOpen={open}
-      onReveal={reveal}
-      onRename={startRename}
-      onCopyName={copyName}
-      onClose={() => (menu = null)}
+  {#if popup && (popup.kind !== "card" || view.current)}
+    <PopupMenu
+      x={popup.x}
+      y={popup.y}
+      alignRight={popup.kind === "more"}
+      items={popup.kind === "card" ? cardItems() : popup.kind === "folder" ? folderItems() : moreItems()}
+      onClose={() => (popup = null)}
+    />
+  {/if}
+
+  {#if confirm}
+    <ConfirmDialog
+      title={confirm.title}
+      message={confirm.message}
+      actions={confirm.actions}
+      onCancel={() => (confirm = null)}
     />
   {/if}
 
@@ -622,8 +802,25 @@
   }
 
   .folder-name {
+    display: inline-flex;
+    align-items: center;
+    align-self: flex-start;
+    gap: var(--space-unit);
+    max-width: 100%;
+    margin: -2px -6px;
+    padding: 2px 6px;
+    border: 0;
+    border-radius: var(--radius-chip);
+    background: none;
+    color: var(--text-primary);
+    font: inherit;
     font-size: 13px;
     font-weight: 600;
+    cursor: pointer;
+  }
+
+  .folder-name:hover {
+    background: var(--fill-hover);
   }
 
   .folder-path {

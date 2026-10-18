@@ -1,54 +1,59 @@
+<script lang="ts" module>
+  export type MenuItem =
+    | { label: string; hint?: string; checked?: boolean; onSelect: () => void }
+    | "separator";
+</script>
+
 <script lang="ts">
-  // The right-click menu on the card: the File Explorer vocabulary people
-  // already know, as the macOS app offers Finder's.
+  // A small menu at a point: the card's right-click menu, the folder menu
+  // and the "…" menu. The arrows move through it, Enter picks, and Esc,
+  // clicking elsewhere or leaving the window closes it.
   let {
     x,
     y,
-    onOpen,
-    onReveal,
-    onRename,
-    onCopyName,
+    items,
+    alignRight = false,
     onClose,
   }: {
     x: number;
     y: number;
-    onOpen: () => void;
-    onReveal: () => void;
-    onRename: () => void;
-    onCopyName: () => void;
+    items: MenuItem[];
+    /** Open leftwards from `x`, for a button at the right of the bar. */
+    alignRight?: boolean;
     onClose: () => void;
   } = $props();
 
   let menu: HTMLDivElement;
-  // Kept on screen when opened near the right or bottom edge.
   let position = $state({ left: 0, top: 0 });
 
   $effect(() => {
+    // Kept inside the window when opened near an edge.
     const { width, height } = menu.getBoundingClientRect();
+    const left = alignRight ? x - width : x;
     position = {
-      left: Math.min(x, window.innerWidth - width - 8),
-      top: Math.min(y, window.innerHeight - height - 8),
+      left: Math.max(8, Math.min(left, window.innerWidth - width - 8)),
+      top: Math.max(8, Math.min(y, window.innerHeight - height - 8)),
     };
     menu.querySelector("button")?.focus();
   });
 
-  function choose(action: () => void) {
+  function choose(item: Exclude<MenuItem, "separator">) {
     onClose();
-    action();
+    item.onSelect();
   }
 
   function onkeydown(e: KeyboardEvent) {
-    const items = [...menu.querySelectorAll("button")];
-    const at = items.indexOf(document.activeElement as HTMLButtonElement);
+    const buttons = [...menu.querySelectorAll("button")];
+    const at = buttons.indexOf(document.activeElement as HTMLButtonElement);
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
       const step = e.key === "ArrowDown" ? 1 : -1;
-      items[(at + step + items.length) % items.length].focus();
+      buttons[(at + step + buttons.length) % buttons.length].focus();
     } else if (e.key === "Escape") {
       e.preventDefault();
       onClose();
     }
-    // Arrows, Enter and Escape belong to the menu while it's open.
+    // The menu has the keyboard while it's open.
     e.stopPropagation();
   }
 </script>
@@ -70,11 +75,16 @@
   style:top="{position.top}px"
   {onkeydown}
 >
-  <button role="menuitem" onclick={() => choose(onOpen)}>Open <span>Enter</span></button>
-  <button role="menuitem" onclick={() => choose(onReveal)}>Show in Explorer</button>
-  <hr />
-  <button role="menuitem" onclick={() => choose(onRename)}>Rename… <span>F2</span></button>
-  <button role="menuitem" onclick={() => choose(onCopyName)}>Copy name</button>
+  {#each items as item}
+    {#if item === "separator"}
+      <hr />
+    {:else}
+      <button role="menuitem" class:checked={item.checked} onclick={() => choose(item)}>
+        <span class="label">{item.label}</span>
+        {#if item.hint}<span class="hint">{item.hint}</span>{/if}
+      </button>
+    {/if}
+  {/each}
 </div>
 
 <style>
@@ -82,6 +92,7 @@
     position: fixed;
     z-index: 10;
     min-width: 200px;
+    max-width: min(420px, calc(100vw - 16px));
     padding: var(--space-unit);
     border: 1px solid var(--hairline);
     border-radius: 8px;
@@ -92,10 +103,11 @@
 
   button {
     display: flex;
+    align-items: baseline;
     justify-content: space-between;
     gap: var(--space-xlarge);
     width: 100%;
-    padding: 6px 10px;
+    padding: 6px 10px 6px 24px;
     border: 0;
     border-radius: 4px;
     background: none;
@@ -108,12 +120,29 @@
   }
 
   button:hover,
-  button:focus-visible,
   button:focus {
     background: var(--fill-hover);
   }
 
-  span {
+  .checked {
+    position: relative;
+  }
+
+  .checked::before {
+    content: "✓";
+    position: absolute;
+    left: 8px;
+    font-size: 12px;
+  }
+
+  .label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .hint {
+    flex-shrink: 0;
     color: var(--text-tertiary);
     font-size: 12px;
   }

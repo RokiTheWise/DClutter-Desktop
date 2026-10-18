@@ -12,7 +12,7 @@
     icon: IconName;
     shortcut?: string;
     disabled?: boolean;
-    onclick: () => void;
+    onclick: (e: MouseEvent) => void;
   } = $props();
 </script>
 
