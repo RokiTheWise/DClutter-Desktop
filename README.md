@@ -8,6 +8,7 @@
 
 [![CI](https://img.shields.io/github/actions/workflow/status/RokiTheWise/DClutter-Windows/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI&labelColor=24292e)](https://github.com/RokiTheWise/DClutter-Windows/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/RokiTheWise/DClutter-Windows?style=flat-square&logo=github&logoColor=white&labelColor=24292e&color=orange)](https://github.com/RokiTheWise/DClutter-Windows/releases)
+[![Stars](https://img.shields.io/github/stars/RokiTheWise/DClutter-Windows?style=flat-square&logo=github&logoColor=white&labelColor=24292e&color=yellow)](https://github.com/RokiTheWise/DClutter-Windows/stargazers)
 [![Downloads](https://img.shields.io/github/downloads/RokiTheWise/DClutter-Windows/total.svg?style=flat-square&logo=github&logoColor=white&labelColor=24292e&color=blue)](https://github.com/RokiTheWise/DClutter-Windows/releases)
 [![Platform](https://img.shields.io/badge/Windows-10%20%7C%2011-lightgrey.svg?style=flat-square&logo=windows&logoColor=white&labelColor=24292e)](#install)
 
