@@ -55,11 +55,15 @@
 
   load();
 
-  // Preload the next image so it's already decoded when its card arrives.
+  // Get the next card's preview ready before it arrives: decode its image,
+  // or have the shell make its thumbnail, which the app then caches.
   $effect(() => {
     const next = view?.upNext;
-    if (next && !next.isDirectory && IMAGE_EXTENSIONS.has(next.extension)) {
+    if (!next) return;
+    if (!next.isDirectory && IMAGE_EXTENSIONS.has(next.extension)) {
       new Image().src = convertFileSrc(next.path);
+    } else {
+      session.thumbnail(next.id).catch(() => {});
     }
   });
 
