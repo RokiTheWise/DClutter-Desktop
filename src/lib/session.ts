@@ -110,6 +110,21 @@ export function fileCurrent(id: string): Promise<SessionView> {
   return invoke("file_current", { id });
 }
 
+/** Mirrors `PreviewImage` in src-tauri/src/lib.rs. */
+export interface PreviewImage {
+  /** A picture of the content, or only the file type's icon. */
+  kind: "thumbnail" | "icon";
+  width: number;
+  height: number;
+  /** A PNG data URL. */
+  src: string;
+}
+
+/** The shell's preview for the current or next card, if it has one. */
+export function thumbnail(id: string): Promise<PreviewImage | null> {
+  return invoke("thumbnail", { id });
+}
+
 /** Opens the file on the card in its default app. */
 export function openCurrent(): Promise<void> {
   return invoke("open_current");
