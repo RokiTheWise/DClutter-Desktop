@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use dclutter_core::{
     DecisionKind, FileCandidate, QueueContext, QueueScorer, ScoreWeights, Step, TriageSession,
 };
-use dclutter_platform::{Destination, DestinationStore, MAX_DESTINATIONS};
+use dclutter_platform::{Destination, DestinationStore, MAX_DESTINATIONS, SessionStore};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
@@ -21,12 +21,14 @@ struct Triage {
     session: TriageSession,
     context: QueueContext,
     scores: HashMap<String, f64>,
+    sessions: SessionStore,
 }
 
 struct AppState {
     triage: Mutex<Option<Triage>>,
     destinations: Mutex<Vec<Destination>>,
     store: DestinationStore,
+    sessions: SessionStore,
 }
 
 /// Everything the triage screen shows, sent after every change.
@@ -115,6 +117,16 @@ impl Triage {
         }
     }
 
+    /// Saves the session after a change, so quitting never loses decisions
+    /// or the ability to undo them. A failed save is logged rather than
+    /// shown: the session itself is fine, and it's retried on the next
+    /// change.
+    fn save(&self) {
+        if let Err(e) = self.sessions.save(&self.folder, &self.session.snapshot()) {
+            eprintln!("Couldn't save the session for {}: {e}", self.folder.display());
+        }
+    }
+
     fn view(&self) -> SessionView {
         let s = &self.session;
         SessionView {
@@ -147,6 +159,7 @@ async fn open_queue(
         None => app.path().download_dir().map_err(|e| e.to_string())?,
     };
 
+    let sessions = state.sessions.clone();
     let triage = tauri::async_runtime::spawn_blocking(move || {
         let candidates = dclutter_platform::candidates_in(&folder)
             .map_err(|e| format!("Couldn't read {}: {e}", folder.display()))?;
@@ -158,8 +171,13 @@ async fn open_queue(
         let context = QueueContext::new(&candidates);
         let ranked = QueueScorer::rank(candidates, now, &ScoreWeights::default());
         let scores = ranked.iter().map(|s| (s.candidate.id.clone(), s.score)).collect();
-        let session = TriageSession::new(ranked.into_iter().map(|s| s.candidate).collect());
-        Ok::<_, String>(Triage { folder, session, context, scores })
+        let queue = ranked.into_iter().map(|s| s.candidate).collect();
+        // Pick up where the last session on this folder left off.
+        let session = match sessions.load(&folder) {
+            Some(saved) => TriageSession::restore(queue, saved, |path| path.exists()),
+            None => TriageSession::new(queue),
+        };
+        Ok::<_, String>(Triage { folder, session, context, scores, sessions })
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -180,6 +198,7 @@ fn decide(state: State<'_, AppState>, kind: DecisionKind) -> Result<SessionView,
     let mut guard = state.triage.lock().unwrap();
     let triage = guard.as_mut().ok_or(NO_FOLDER)?;
     triage.session.decide(kind);
+    triage.save();
     Ok(triage.view())
 }
 
@@ -197,6 +216,7 @@ fn undo(state: State<'_, AppState>) -> Result<Change, String> {
         triage.session.redo();
         return Err(format!("{e} It's still filed."));
     }
+    triage.save();
     Ok(Change { view: triage.view(), kind: step.map(|s| s.kind) })
 }
 
@@ -209,6 +229,7 @@ fn redo(state: State<'_, AppState>) -> Result<Change, String> {
         triage.session.undo();
         return Err(e.to_string());
     }
+    triage.save();
     Ok(Change { view: triage.view(), kind: step.map(|s| s.kind) })
 }
 
@@ -251,6 +272,7 @@ async fn commit_trash(
         let mut guard = state.triage.lock().unwrap();
         let triage = guard.as_mut().ok_or(NO_FOLDER)?;
         triage.session.unstage(excluded.iter().map(String::as_str));
+        triage.save();
         triage.session.staged().into_iter().map(|c| (c.id.clone(), c.path.clone())).collect()
     };
 
@@ -273,6 +295,7 @@ async fn commit_trash(
     let mut guard = state.triage.lock().unwrap();
     let triage = guard.as_mut().ok_or(NO_FOLDER)?;
     triage.session.commit_trashed(trashed.iter().map(String::as_str));
+    triage.save();
     let error = match errors.as_slice() {
         [] => None,
         [only] => Some(only.clone()),
@@ -349,7 +372,11 @@ async fn file_current(state: State<'_, AppState>, id: String) -> Result<SessionV
         let triage = guard.as_mut().ok_or(NO_FOLDER)?;
         let current = triage.session.current().ok_or("Nothing to file")?;
         let planned = folder.join(current.file_name());
-        triage.session.begin_file(planned).ok_or("Nothing to file")?
+        let started = triage.session.begin_file(planned).ok_or("Nothing to file")?;
+        // Saved before the file is touched, so even a crash mid-move leaves
+        // a record that can undo it.
+        triage.save();
+        started
     };
 
     // A move to another drive is a copy, which can take a while for big
@@ -366,10 +393,12 @@ async fn file_current(state: State<'_, AppState>, id: String) -> Result<SessionV
     match moved {
         Ok(landed) => {
             triage.session.amend_last_move(&file_id, landed);
+            triage.save();
             Ok(triage.view())
         }
         Err(e) => {
             triage.session.withdraw_last_move(&file_id);
+            triage.save();
             Err(e.to_string())
         }
     }
@@ -425,6 +454,7 @@ pub fn run() {
                 triage: Mutex::new(None),
                 destinations: Mutex::new(store.load()),
                 store,
+                sessions: SessionStore::new(app.path().app_data_dir()?.join("sessions")),
             });
             // The window starts hidden so it never shows at the wrong size.
             if let Some(window) = app.get_webview_window("main") {
