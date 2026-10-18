@@ -11,7 +11,9 @@
   import { IMAGE_EXTENSIONS } from "$lib/components/Preview.svelte";
   import RenameField from "$lib/components/RenameField.svelte";
   import ReviewTrash from "$lib/components/ReviewTrash.svelte";
+  import SettingsPanel, { type SettingsSection } from "$lib/components/SettingsPanel.svelte";
   import { HeldDecision } from "$lib/held";
+  import { loadHoldSpeed, saveHoldSpeed } from "$lib/settings";
   import * as session from "$lib/session";
   import type { DecisionKind, DestinationItem, SessionView, StagedItem } from "$lib/session";
 
@@ -51,6 +53,19 @@
   let entrance = $state<Entrance>("rise");
 
   const held = new HeldDecision();
+  let holdSpeed = $state(loadHoldSpeed());
+  $effect(() => saveHoldSpeed(holdSpeed));
+
+  let settingsOpen = $state(false);
+  let settingsSection = $state<SettingsSection>("general");
+
+  function openSettings(section: SettingsSection) {
+    held.stop();
+    shelfOpen = false;
+    menu = null;
+    settingsSection = section;
+    settingsOpen = true;
+  }
   const folderName = $derived(view?.folder.split(/[\\/]/).filter(Boolean).pop() ?? "");
 
   async function load() {
@@ -289,8 +304,9 @@
   }
 
   function onkeydown(e: KeyboardEvent) {
-    // The review list, the rename field and the menu handle their own keys.
-    if (!view || review || renaming || menu) return;
+    // The review list, the rename field, the menu and the settings handle
+    // their own keys.
+    if (!view || review || renaming || menu || settingsOpen) return;
 
     // While the shelf is open the arrows steer it instead of deciding.
     if (shelfOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
@@ -329,6 +345,9 @@
       if (key === "n") {
         e.preventDefault();
         addFolder();
+      } else if (key === ",") {
+        e.preventDefault();
+        openSettings("general");
       } else if (key === "z") {
         e.preventDefault();
         e.shiftKey ? redo() : undo();
@@ -347,11 +366,11 @@
       case "ArrowRight":
         e.preventDefault();
         // The held-decision timer paces repeats, not the system.
-        if (!e.repeat) held.start(e.key, () => makeDecision("keep"));
+        if (!e.repeat) held.start(e.key, () => makeDecision("keep"), holdSpeed);
         break;
       case "ArrowLeft":
         e.preventDefault();
-        if (!e.repeat) held.start(e.key, () => makeDecision("stage"));
+        if (!e.repeat) held.start(e.key, () => makeDecision("stage"), holdSpeed);
         break;
       case " ":
         e.preventDefault();
@@ -370,6 +389,10 @@
       case "Enter":
         e.preventDefault();
         if (!e.repeat) open();
+        break;
+      case "?":
+        e.preventDefault();
+        openSettings("controls");
         break;
       case "1":
       case "2":
@@ -444,6 +467,15 @@
 {:else}
   <main>
     <header>
+      <span class="settings-toggle" data-settings-toggle>
+        <IconButton
+          title="Settings"
+          icon="settings"
+          shortcut="Ctrl+,"
+          onclick={() => (settingsOpen ? (settingsOpen = false) : openSettings("general"))}
+        />
+      </span>
+
       <div class="folder">
         <span class="folder-name">{folderName}</span>
         <span class="folder-path" title={view.folder}>{view.folder}</span>
@@ -467,6 +499,9 @@
         Review trash
         <span class="count">{view.staged}</span>
       </button>
+      {#if settingsOpen}
+        <SettingsPanel bind:section={settingsSection} bind:holdSpeed onClose={() => (settingsOpen = false)} />
+      {/if}
     </header>
 
     <section class="stage">
@@ -572,6 +607,7 @@
   }
 
   header {
+    position: relative;
     display: flex;
     align-items: center;
     gap: var(--space-medium);
